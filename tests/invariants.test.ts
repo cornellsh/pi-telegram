@@ -17,6 +17,10 @@ const validateWorkflowSource = readFileSync(
   join(PROJECT_ROOT, ".github", "workflows", "validate.yml"),
   "utf8",
 );
+const changelogSource = readFileSync(
+  join(PROJECT_ROOT, "CHANGELOG.md"),
+  "utf8",
+);
 
 function getProjectTypeScriptFiles(): string[] {
   return [
@@ -32,6 +36,22 @@ function getProjectTypeScriptFiles(): string[] {
       .map((name) => join("tests", name)),
   ].sort();
 }
+
+test("Unreleased changelog respects the project release-entry budget", () => {
+  const unreleased = changelogSource.match(
+    /^## Unreleased\n([\s\S]*?)(?=^## |$(?![\s\S]))/mu,
+  )?.[1];
+  assert.ok(unreleased, "CHANGELOG.md must retain an Unreleased section");
+  const entries = unreleased
+    .split("\n")
+    .filter((line) => line.startsWith("- "));
+  assert.ok(entries.length <= 8, "Unreleased must contain at most 8 entries");
+  assert.deepEqual(
+    entries.filter((entry) => entry.length > 512),
+    [],
+    "Unreleased entries must contain at most 512 characters",
+  );
+});
 
 test("Release CI validates exact tags and publishes through npm Trusted Publisher", () => {
   assert.match(validateWorkflowSource, /^  workflow_call:$/m);
@@ -322,6 +342,8 @@ test("Entrypoint stays a composition root without local runtime adapters", () =>
   assert.equal(source.includes("new Set"), false);
   assert.equal(source.includes("!."), false);
   assert.equal(/\bpi\./.test(source), false);
+  assert.equal(source.includes("Threads.createTelegramTopicTargetRenamer"), false);
+  assert.match(source, /telegramBusLeaderRuntime\.renameLeaderThread!?\s*\(/u);
   assert.deepEqual(
     [
       "Queue.createTelegramQueueMutationController",
@@ -362,15 +384,92 @@ test("Visible thread identity never falls back directly to bare slot labels", ()
   assert.deepEqual(violations, []);
 });
 
-test("Destructive forum-topic lifecycle cleanup stays in the thread reconciler", () => {
-  const directCleanupFiles = getProjectSourceFiles().filter((file) => {
-    if (file === join("lib", "thread-reconciler.ts")) return false;
+test("Automatic Workspace retirement stays disconnected from production composition", () => {
+  const compositionSource = stripSourceTextAndComments(
+    readFileSync(join(PROJECT_ROOT, "index.ts"), "utf8"),
+  );
+  assert.match(
+    compositionSource,
+    /createTelegramWorkspaceAdmissionRuntimeBinding\s*\(/u,
+  );
+  assert.match(
+    compositionSource,
+    /getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve/u,
+  );
+  assert.match(
+    compositionSource,
+    /createTelegramBusFollowerPromotionHandler[\s\S]*?getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve[\s\S]*?startLeader/u,
+  );
+  assert.match(
+    compositionSource,
+    /targetReplacement:\s*\{[\s\S]*?getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve[\s\S]*?getSyncState/u,
+  );
+  assert.match(
+    compositionSource,
+    /staleTopicApiErrorRecoveryDeps\s*=\s*\{[\s\S]*?getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve/u,
+  );
+  assert.match(
+    compositionSource,
+    /workspaceAdmission:\s*workspaceAdmissionRuntime\.resolve/u,
+  );
+  assert.match(
+    compositionSource,
+    /createTelegramWorkspaceOperationRuntime[\s\S]*?getWorkspaceAdmission:\s*workspaceAdmissionRuntime\.resolve/u,
+  );
+  for (const factory of [
+    "createTelegramObservedTopicLifecycleSyncHandler",
+    "createTelegramInboundRouteRuntime",
+    "createTelegramBusLeaderRuntimeAssembly",
+    "createTelegramThreadDisconnectAssembly",
+  ]) {
+    assert.match(
+      compositionSource,
+      new RegExp(
+        `${factory}[\\s\\S]*?runWorkspaceOperation:\\s*telegramWorkspaceOperationRuntime\\.run`,
+        "u",
+      ),
+    );
+  }
+  assert.match(
+    compositionSource,
+    /getExternalReservedSlots:\s*function\s*\(\)/u,
+  );
+  const busLeaderSource = readFileSync(
+    join(PROJECT_ROOT, "lib", "bus-leader.ts"),
+    "utf8",
+  );
+  assert.match(
+    busLeaderSource,
+    /const provisionerPorts\s*=\s*\{[\s\S]*?runWorkspaceOperation,[\s\S]*?recordRuntimeEvent/u,
+  );
+  assert.match(
+    busLeaderSource,
+    /operationKind:\s*"workspace\.reconcile-follower-provision"/u,
+  );
+  const retirementSource = readFileSync(
+    join(PROJECT_ROOT, "lib", "workspace-retirement.ts"),
+    "utf8",
+  );
+  assert.match(retirementSource, /issueDeletionPermit\s*\(/u);
+  assert.match(retirementSource, /input\.deleteForumTopic\s*\(/u);
+  assert.match(
+    retirementSource,
+    /pruneTelegramWorkspaceJournalEvidence[\s\S]*?admission:\s*Pick<[\s\S]*?operationKind:\s*"workspace\.prune-journal-evidence"/u,
+  );
+  const productionRetirementEntrypoints = [
+    "runTelegramWorkspaceRetirementLifecycle",
+    "executeTelegramWorkspaceRetirement",
+  ];
+  const productionConsumers = getProjectSourceFiles().filter((file) => {
+    if (file === join("lib", "workspace-retirement.ts")) return false;
     const source = stripSourceTextAndComments(
       readFileSync(join(PROJECT_ROOT, file), "utf8"),
     );
-    return /\b(?:closeForumTopic|deleteForumTopic)\b/.test(source);
+    return productionRetirementEntrypoints.some((entrypoint) =>
+      new RegExp(`\\b${entrypoint}\\b`, "u").test(source),
+    );
   });
-  assert.deepEqual(directCleanupFiles, []);
+  assert.deepEqual(productionConsumers, []);
 });
 
 test("Runtime state domain stays free of local domain imports", () => {

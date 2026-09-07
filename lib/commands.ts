@@ -186,6 +186,10 @@ export function formatTelegramCommandEmojiPrefix(
   return `${getTelegramCommandEmoji(command)} `;
 }
 
+export function formatTelegramPiCommandHtml(command: string): string {
+  return `<code>${escapeHtml(command)}</code>`;
+}
+
 export function formatTelegramInformationHeading(
   emoji: string,
   text: string,
@@ -319,6 +323,7 @@ export function createTelegramBotCommandRegistrar(
 export interface TelegramBridgeCommandStartPollingOptions {
   force?: boolean;
   forceFreshLeaderThread?: boolean;
+  requestedThreadName?: string;
 }
 
 export interface TelegramBridgeCommandStartPollingResult {
@@ -358,13 +363,28 @@ export interface TelegramBridgeCommandRegistrationDeps {
     ctx: ExtensionCommandContext,
     profileName: string,
   ) => Promise<boolean>;
+  validateThreadName?: (threadName: string) => string | undefined;
+  renameCurrentThread?: (
+    threadName: string,
+  ) => Promise<{ ok: boolean; threadName?: string; message?: string }>;
 }
 
 function parseTelegramProfileArg(args: string): string | undefined {
   const word = args.trim().split(/\s+/)[0];
   if (!word || word.length === 0) return undefined;
-  if (word.startsWith("-")) return undefined;
+  if (word.startsWith("-") || /^as=/i.test(word)) return undefined;
   return word === TELEGRAM_DEFAULT_PROFILE_NAME ? undefined : word;
+}
+
+export function parseTelegramRequestedThreadName(
+  args: string,
+): string | undefined {
+  const token = args
+    .trim()
+    .split(/\s+/)
+    .find((word) => /^as=/i.test(word));
+  const value = token?.slice(3).trim();
+  return value || undefined;
 }
 
 function formatTelegramTakeoverTitle(ctx: ExtensionCommandContext): string {
@@ -403,9 +423,28 @@ export function registerTelegramBridgeCommands(
     },
   });
   pi.registerCommand("telegram-connect", {
-    description: "Start the Telegram bridge. Use /telegram-connect <name> for named profiles.",
+    description:
+      "Start the Telegram bridge. Use /telegram-connect <profile> and optional as=Name for a fresh Workspace Thread.",
     handler: async (args, ctx) => {
       const profileName = parseTelegramProfileArg(args);
+      const requestedNameTokens = args
+        .trim()
+        .split(/\s+/)
+        .filter((word) => /^as=/i.test(word));
+      const requestedThreadName = parseTelegramRequestedThreadName(args);
+      const requestedNameError =
+        requestedNameTokens.length > 1
+          ? "Specify at most one as=Name Workspace Thread name."
+          : requestedNameTokens.length === 1 && !requestedThreadName
+            ? "Usage: /telegram-connect [profile] as=Flightprice"
+            : requestedThreadName
+              ? deps.validateThreadName?.(requestedThreadName)
+              : undefined;
+      if (requestedNameError) {
+        ctx.ui.notify(requestedNameError, "warning");
+        deps.updateStatus(ctx);
+        return;
+      }
       if (profileName && deps.activateProfileConfig) {
         const ok = await deps.activateProfileConfig(ctx, profileName);
         if (!ok) {
@@ -466,6 +505,7 @@ export function registerTelegramBridgeCommands(
       };
       let result = await startWithRecovery({
         forceFreshLeaderThread: true,
+        ...(requestedThreadName ? { requestedThreadName } : {}),
       });
       if (result && !result.ok && result.canTakeover) {
         const confirmed = await ctx.ui.confirm(
@@ -480,6 +520,7 @@ export function registerTelegramBridgeCommands(
         result = await startWithRecovery({
           force: true,
           forceFreshLeaderThread: true,
+          ...(requestedThreadName ? { requestedThreadName } : {}),
         });
       }
       if (result?.message) {
@@ -488,6 +529,38 @@ export function registerTelegramBridgeCommands(
       if (!result || result.ok) {
         deps.queueAgentConnectionContext?.(true);
       }
+      deps.updateStatus(ctx);
+    },
+  });
+  pi.registerCommand("telegram-name", {
+    description:
+      "Set this Workspace's named-mode identity. Use one unique capitalized Latin word.",
+    handler: async (args, ctx) => {
+      const threadName = args.trim();
+      if (!threadName) {
+        ctx.ui.notify("Usage: /telegram-name Flightprice", "warning");
+        deps.updateStatus(ctx);
+        return;
+      }
+      const validationError = deps.validateThreadName?.(threadName);
+      if (validationError) {
+        ctx.ui.notify(validationError, "warning");
+        deps.updateStatus(ctx);
+        return;
+      }
+      if (!deps.renameCurrentThread) {
+        ctx.ui.notify("Telegram Workspace naming is unavailable.", "warning");
+        deps.updateStatus(ctx);
+        return;
+      }
+      const result = await deps.renameCurrentThread(threadName);
+      ctx.ui.notify(
+        result.message ??
+          (result.ok
+            ? `Telegram Workspace name saved as ${result.threadName ?? threadName}.`
+            : "Telegram Workspace name update failed."),
+        result.ok ? "info" : "warning",
+      );
       deps.updateStatus(ctx);
     },
   });

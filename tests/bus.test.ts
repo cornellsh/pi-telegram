@@ -6,14 +6,16 @@
 import assert from "node:assert/strict";
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   statSync,
   unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { Worker } from "node:worker_threads";
 
 import {
   classifyTelegramBusTransportError,
@@ -42,6 +44,7 @@ import {
   getTelegramBusSocketPath,
   getTelegramFollowerTargetOwnership,
   getTelegramProcessBirthIdentity,
+  getTelegramProcessBirthIdentityLiveness,
   getTelegramProcessLiveness,
   hasTelegramBusCapability,
   isTelegramBusEnvelopeAuthorized,
@@ -54,7 +57,13 @@ import {
   sendTelegramBusLocalEnvelope,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
+  TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
 } from "../lib/bus.ts";
+import {
+  getTelegramThreadOwnerFromProfileKey,
+  getTelegramThreadOwnerKey,
+} from "../lib/threads.ts";
 
 test("Bus envelope auth compares the exact secret in constant time", () => {
   const secret = "leader-minted-secret";
@@ -285,6 +294,33 @@ test("Process liveness requires a stable platform birth proof", () => {
     ),
     "unverifiable",
   );
+});
+
+test("Wrapped follower owner keys expose their raw process-birth identity", () => {
+  for (const telegramProfile of [undefined, "work"]) {
+    const key = getTelegramThreadOwnerKey({ kind: "manual-follower",
+      instanceId: "42:start:12345", ...(telegramProfile ? { telegramProfile } : {}) });
+    const owner = getTelegramThreadOwnerFromProfileKey(key);
+    assert.equal(owner.kind, "manual-follower");
+    if (owner.kind !== "manual-follower") continue;
+    assert.equal(owner.instanceId, "42:start:12345");
+    assert.equal(getTelegramProcessBirthIdentityLiveness(owner.instanceId, {
+      platform: "linux", isProcessAlive: () => false,
+    }), "dead");
+  }
+});
+
+test("Process birth identity liveness fails closed for opaque and live fallback identities", () => {
+  const stat = `(worker) S ${Array(18).fill("0").join(" ")} 12345`;
+  const options = { platform: "linux" as const, isProcessAlive: () => true,
+    readProcStat: () => stat };
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:12345", options), "alive");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:999", options), "dead");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:generation:fallback", options), "unverifiable");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("opaque", options), "unverifiable");
+  assert.equal(getTelegramProcessBirthIdentityLiveness("42:start:12345", {
+    ...options, isProcessAlive: () => false,
+  }), "dead");
 });
 
 test("Process birth identity preserves Linux start ticks and fallback", () => {
@@ -528,6 +564,35 @@ test("Bus contract encodes and parses follower registration envelopes", () => {
   );
 });
 
+test("Bus contract encodes and parses Workspace follower restore envelopes", () => {
+  const envelope = {
+    kind: "follower.restoreWorkspace" as const,
+    requestId: "inst-a:restore:1",
+    registration: {
+      instanceId: "inst-a",
+      cwd: "/work/project",
+      pid: 123,
+      protocol: createTelegramBusProtocolIdentity({
+        runtimeBuild: "0.45.0",
+        capabilities: [
+          TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
+        ],
+      }),
+      connectedAtMs: 1000,
+    },
+  };
+
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+    envelope,
+  );
+  assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "bootstrap");
+  assert.equal(
+    TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT,
+    "workspace-follower-auto-connect-v1",
+  );
+});
+
 test("Bus contract encodes and parses explicit follower disconnect envelopes", () => {
   const envelope = {
     kind: "follower.disconnect" as const,
@@ -540,6 +605,37 @@ test("Bus contract encodes and parses explicit follower disconnect envelopes", (
   assert.deepEqual(
     parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
     envelope,
+  );
+});
+
+test("Bus contract validates exact-generation Thread display setting envelopes", () => {
+  for (const mode of ["letters", "names", "directories"] as const) {
+    const envelope = { kind: "follower.setThreadDisplayMode" as const,
+      requestId: "one", instanceId: "follower", registrationGeneration: "generation", mode };
+    assert.deepEqual(parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()), envelope);
+    assert.equal(getTelegramBusEnvelopeTrafficClass(envelope), "generation-fenced");
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, mode: "invalid" })), undefined);
+    assert.equal(parseTelegramBusEnvelope(JSON.stringify({ ...envelope, registrationGeneration: undefined })), undefined);
+  }
+});
+
+test("Bus contract encodes and parses Workspace Thread rename envelopes", () => {
+  const envelope = {
+    kind: "follower.renameThread" as const,
+    requestId: "inst-a:3",
+    instanceId: "inst-a",
+    registrationGeneration: "inst-a:1",
+    threadName: "Navigator",
+    sentAtMs: 2000,
+  };
+
+  assert.deepEqual(
+    parseTelegramBusEnvelope(encodeTelegramBusEnvelope(envelope).trimEnd()),
+    envelope,
+  );
+  assert.equal(
+    TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
+    "workspace-thread-rename-v1",
   );
 });
 
@@ -1607,6 +1703,79 @@ test("Bus local client classifies response timeouts as transport timeouts", asyn
     assert.equal(events[0].details.requestId, "inst-a:timeout");
   } finally {
     await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Bus local client accepts a buffered response after its event loop resumes past the deadline", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-client-stall-"));
+  const socketPath = getTelegramBusFollowerEndpoint({
+    agentDir: dir,
+    platform: process.platform,
+    instanceId: "stall-test",
+  });
+  if (process.platform !== "win32") {
+    mkdirSync(dirname(socketPath), { recursive: true });
+  }
+  const worker = new Worker(
+    `
+      import { createServer } from "node:net";
+      import { parentPort, workerData } from "node:worker_threads";
+
+      const server = createServer((socket) => {
+        let buffer = "";
+        socket.setEncoding("utf8");
+        socket.on("error", () => undefined);
+        socket.on("data", (chunk) => {
+          buffer += chunk;
+          const newlineIndex = buffer.indexOf("\\n");
+          if (newlineIndex < 0) return;
+          const envelope = JSON.parse(buffer.slice(0, newlineIndex));
+          parentPort.postMessage("received");
+          setTimeout(() => {
+            socket.write(JSON.stringify({
+              kind: "bus.ack",
+              requestId: envelope.requestId,
+              ok: true,
+            }) + "\\n");
+          }, 5);
+        });
+      });
+      server.listen(workerData.socketPath, () => parentPort.postMessage("ready"));
+    `,
+    { eval: true, workerData: { socketPath } },
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      worker.once("message", (message) => {
+        if (message === "ready") resolve();
+        else reject(new Error(`Unexpected worker message: ${String(message)}`));
+      });
+      worker.once("error", reject);
+    });
+    const received = new Promise<void>((resolve) => {
+      worker.once("message", () => resolve());
+    });
+    const responsePromise = sendTelegramBusLocalEnvelope({
+      socketPath,
+      timeoutMs: 100,
+      envelope: {
+        kind: "follower.heartbeat",
+        requestId: "inst-a:stalled-event-loop",
+        instanceId: "inst-a",
+        sentAtMs: 2000,
+      },
+    });
+    await received;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+    assert.deepEqual(await responsePromise, {
+      kind: "bus.ack",
+      requestId: "inst-a:stalled-event-loop",
+      ok: true,
+      message: undefined,
+    });
+  } finally {
+    await worker.terminate();
     rmSync(dir, { recursive: true, force: true });
   }
 });

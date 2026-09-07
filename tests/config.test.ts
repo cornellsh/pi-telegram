@@ -39,6 +39,8 @@ import {
   normalizeTelegramDefaultProfileConfig,
   pairTelegramUserIfNeeded,
   readTelegramConfig,
+  resolveTelegramThreadDisplayMode,
+  setTelegramThreadDisplayMode,
   setGlobalTelegramConfigRuntime,
   updateTelegramVoiceConfig,
   writeTelegramConfig,
@@ -56,6 +58,72 @@ import {
   getTelegramBotTokenPromptSpec,
   runTelegramSetup,
 } from "../lib/setup.ts";
+
+test("Thread display mode defaults to names and accepts only the three modes", () => {
+  for (const mode of [undefined, "names", "invalid", null]) {
+    assert.equal(resolveTelegramThreadDisplayMode(legacyConfig({
+      threadDisplayMode: mode,
+    })), "names");
+  }
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "letters" }), "letters");
+  assert.equal(resolveTelegramThreadDisplayMode({ threadDisplayMode: "directories" }), "directories");
+});
+
+test("Thread display mode persists per profile and survives effective config updates", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-display-mode-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({ agentDir, configPath, initialConfig: {
+    profiles: {
+      default: { botToken: "token-default", threadDisplayMode: "letters" },
+      work: { botToken: "token-work", threadDisplayMode: "directories" },
+    },
+  } });
+  try {
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "letters");
+    store.activateProfile("work");
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    store.update((config) => { config.assistant = { rendering: "html" }; });
+    await store.persist();
+    const saved = await readTelegramConfig(configPath);
+    assert.equal(saved.threadDisplayMode, undefined);
+    assert.equal(saved.profiles?.default.threadDisplayMode, "letters");
+    assert.equal(saved.profiles?.work.threadDisplayMode, "directories");
+    const restored = createTelegramConfigStore({ agentDir, configPath });
+    await restored.load();
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "letters");
+    restored.activateProfile("work");
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "directories");
+    restored.update((config) => { config.threadDisplayMode = "names"; });
+    await restored.persist();
+    restored.activateProfile("default");
+    assert.equal(resolveTelegramThreadDisplayMode(restored.get()), "letters");
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("Thread display preference writes fence authority inside the config transaction", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "pi-telegram-display-fence-"));
+  const configPath = join(agentDir, "telegram.json");
+  const store = createTelegramConfigStore({ agentDir, configPath,
+    initialConfig: { profiles: { default: { botToken: "token" } } } });
+  try {
+    await store.persist();
+    await setTelegramThreadDisplayMode(store, "directories", () => true);
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    let current = true;
+    const pending = store.persist({ ...store.get(), threadDisplayMode: "letters" }, {
+      isCurrent: () => current,
+    });
+    current = false;
+    await assert.rejects(pending, /originating authority/);
+    assert.equal((await readTelegramConfig(configPath)).profiles?.default.threadDisplayMode, "directories");
+    assert.equal(resolveTelegramThreadDisplayMode(store.get()), "directories");
+    await assert.rejects(setTelegramThreadDisplayMode(store, "names", () => false), /authority/);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
 
 test("Config projections own bot and effective profile lookup", () => {
   const store = createTelegramConfigStore({

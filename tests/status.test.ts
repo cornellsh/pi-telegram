@@ -279,6 +279,20 @@ test("Status bar text renders bridge connection and queue states", () => {
       pollingActive: false,
       paired: true,
       busRole: "follower",
+      followerRegistered: false,
+      instanceThreadName: "Haven",
+      compactionInProgress: false,
+      processing: false,
+      queuedStatus: " +1",
+    }),
+    "<accent>Haven</accent> <warning>reconnecting</warning><success> +1</success>",
+  );
+  assert.equal(
+    buildTelegramStatusBarText(theme, {
+      hasBotToken: true,
+      pollingActive: false,
+      paired: true,
+      busRole: "follower",
       instanceThreadName: "Amber",
       compactionInProgress: false,
       processing: true,
@@ -729,12 +743,14 @@ test("Bridge status runtime stays active while tools run after queue changes", (
 test("Persistent polling conflict remains visible across ordinary refreshes until transport recovers", () => {
   let stopReason: string | undefined = "persistent-conflict";
   let busRole: "follower" | undefined;
+  let followerRegistered = false;
   const rendered: string[] = [];
   const runtime = createTelegramBridgeStatusRuntime({
     getConfig: () => ({ botToken: "token", allowedUserId: 7 }),
     isPollingActive: () => stopReason === undefined,
     getPollingState: () => ({ phase: stopReason ? "stopped" : "starting", stopReason }),
     getBusRole: () => busRole,
+    getLocalBus: () => (busRole ? { followerRegistered } : undefined),
     getActiveSourceMessageIds: () => undefined, hasActiveTurn: () => false,
     hasDispatchPending: () => false, isCompactionInProgress: () => false,
     getActiveToolExecutions: () => 0, hasPendingModelSwitch: () => false,
@@ -749,6 +765,9 @@ test("Persistent polling conflict remains visible across ordinary refreshes unti
   assert.deepEqual(rendered, ["telegram error", "telegram error"]);
   assert.ok(runtime.getStatusLines().some((line) => line.includes("persistent-conflict")));
   busRole = "follower";
+  runtime.updateStatus(ctx);
+  assert.equal(rendered.at(-1), "telegram reconnecting");
+  followerRegistered = true;
   runtime.updateStatus(ctx);
   assert.equal(rendered.at(-1), "telegram follower");
   busRole = undefined;

@@ -55,7 +55,7 @@ Paste the bot token. If `~/.pi/agent/telegram.json` already contains a saved tok
 /telegram-connect
 ```
 
-The connected Pi instance owns Telegram polling. Use `/telegram-connect <name>` to activate a named profile. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers.
+The connected Pi instance owns Telegram polling. Use `/telegram-connect <profile>` to activate a named profile, and optionally append `as=Name` to name a fresh Workspace Thread. Each profile is a parallel bot runtime with isolated polling, diagnostics, Threaded Mode state, and local bus transport; the `default` profile keeps unsuffixed runtime paths. In classic mode each profile uses a singleton lock. When Telegram private-chat Threaded Mode is available, one live instance becomes the profile's leader and later visible Pi instances register as followers. A reopened follower Workspace with a remembered Thread reconnects automatically at session startup; a new Workspace still requires explicit `/telegram-connect`.
 
 After an unclean computer shutdown, `/telegram-connect` detects truncated or structurally invalid temporary ownership/routing files, quarantines only the damaged files under `tmp/telegram/recovery/`, and retries once. A journal snapshot removed by older broad temp cleanup is rebuilt when its complete segment history proves an empty result, while a revisionless snapshot is repaired from the first surviving segment's exact predecessor when the reconstructed tail validates. Otherwise the snapshot and segments are quarantined as recovery evidence, a fresh journal is published, and startup continues with an informational diagnostic instead of requiring manual JSON repair. Saved `telegram.json` configuration and runtime diagnostics remain intact. Recovery never replaces a verifiable live owner; if safe automatic recovery cannot complete, the command gives one explicit Pi-restart instruction instead of requiring deletion of the whole `tmp/` directory.
 
@@ -181,6 +181,8 @@ Run these inside Pi.
 | `/telegram-setup <profile>` | Save or update a named-profile bot token |
 | `/telegram-connect` / `/telegram-connect default` | Activate `profiles.default` and acquire its transport ownership |
 | `/telegram-connect <profile>` | Activate a named profile and acquire its transport ownership |
+| `/telegram-connect [profile] as=Name` | Give a fresh Workspace Thread one unique capitalized Latin-word name while connecting |
+| `/telegram-name Name` | Save the Workspace's named-mode identity; only Names mode also changes the visible title |
 | `/telegram-disconnect` | Confirm, then stop polling, release ownership, and delete this instance's Threaded Mode tab; graceful Pi quit always preserves restart ownership and independently deletes the tab only when automatic cleanup is enabled |
 | `/telegram-status` | Inspect connection, mode, separate polling/worker progress, journal depth, queue, transport, automatic retry state, and recent diagnostics |
 
@@ -212,7 +214,7 @@ The detailed contract lives in [Priority, Reactions, Keep, and Skip](./docs/arch
 
 ### Native Rich Markdown
 
-Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs. Activity thinking uses persistent headerless expandable HTML, while each completed tool uses one iconless native Rich root details node whose arguments open with the root while secondary JSON evidence stays collapsed; `thinking`, `tools`, and `verbose` select the visible classes, while menus, status rows, queue controls, settings, diagnostics, and other operational UI retain explicit Telegram HTML/plain rendering. Three Settings controls keep the layers separate: `Draft previews` toggles streamed answer drafts, `Activity` chooses `quiet` or `verbose` technical activity, and `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
+Rich Markdown is the default model-answer membrane. Complete assistant and guest model replies use Telegram's native Rich Message APIs; valid bot commands and URLs retain Telegram's native clickable affordances. Activity thinking uses persistent headerless expandable HTML, while each completed tool uses one iconless native Rich root details node whose arguments open with the root while secondary JSON evidence stays collapsed; `thinking`, `tools`, and `verbose` select the visible classes, while menus, status rows, queue controls, settings, diagnostics, and other operational UI retain explicit Telegram HTML/plain rendering. Three Settings controls keep the layers separate: `Draft previews` toggles streamed answer drafts, `Activity` chooses `quiet` or `verbose` technical activity, and `Assistant rendering` chooses final-answer delivery (`rich` Native Rich Markdown or `html` legacy Markdown-to-HTML).
 
 ### Files And Artifacts
 
@@ -234,9 +236,11 @@ Classic private DM mode is the base product mode. When Telegram private-chat Thr
 - Followers are visible Pi processes started by the operator.
 - Each connected instance gets a Telegram thread target.
 - Queued work for a live follower transfers through authenticated exact-journal handoff rather than replaying under the transport owner.
-- Follower session replacement automatically reconnects the new session context to the same thread instead of requiring another manual connect.
+- Follower session replacement preserves registration, and a reopened follower Workspace with a remembered Thread reconnects automatically without allocating a Thread for an unremembered Workspace.
 - Unknown threads are preserved and offered explicit reroute/restore choices.
 - Telegram never launches hidden Pi processes.
+
+In Threaded Mode, open Settings → **🧵 Thread display** to choose **Letters**, **Names (default)**, or **Directories** for this bot profile. Telegram tab titles, Pi terminal status, live Thread choosers/notices, prompt attribution, and named `telegram_message` targeting use the same acknowledged display name; target IDs and live registrations still own routing. Directory mode adds persistent global-letter suffixes when a Workspace has multiple instances, such as `extensions_a` and `extensions_c`. Switching preserves Thread IDs, slots, and saved names. Letters and Directories require compatible connected followers; Names remains available with legacy peers. Partial application reports an error and can be retried without recreating Threads.
 
 | Mode | Best for | Runtime shape |
 | --- | --- | --- |
@@ -289,7 +293,7 @@ Durable inbound admission is a **process-crash recovery** guarantee. Atomic priv
 
 Telegram is a companion surface around a live Pi runtime, not a second runtime. It can compact the current session, but it cannot create, resume, fork, browse, or switch sessions until Pi exposes safe public extension APIs for those operations.
 
-A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. The bundled `telegram-bridge` Skill owns general agent operation, `generated-control-surface` proactively compiles optional evidence-backed ephemeral controls when model interpretation remains useful, and `generative-apps` compiles stable repeated interaction into reviewed reusable applications whose bound buttons bypass model inference while ordinary prompt buttons retain it. Generative Apps may own a closed state machine or adapt another authoritative tool, service, Actor Run, or application through bounded methods. Disconnecting removes pi-telegram's delivery tools and transient routing guidance from later requests until direct ownership or follower registration returns, without changing other active Pi tools. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
+A Telegram prompt is a normal model turn in the active Pi session and therefore inherits that session's active post-compaction context; the bridge does not make token cost proportional only to the new mobile message. The bundled `telegram-bridge` Skill owns general agent operation; `show-me` turns current work and system behavior into truthful phone-width Markdown or focused browser-ready HTML while remaining useful in the terminal; `generated-control-surface` proactively compiles optional evidence-backed ephemeral controls when model interpretation remains useful; and `generative-apps` compiles stable repeated interaction into reviewed reusable applications whose bound buttons bypass model inference while ordinary prompt buttons retain it. Generative Apps may own a closed state machine or adapt another authoritative tool, service, Actor Run, or application through bounded methods. Disconnecting removes pi-telegram's delivery tools and transient routing guidance from later requests until direct ownership or follower registration returns, without changing other active Pi tools. Pi session JSONL contains model history; profile-scoped pi-telegram `logs*.jsonl` contains redacted operational events and is never model context.
 
 ## Documentation Map
 

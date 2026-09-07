@@ -195,7 +195,7 @@ function runRegistrationRecoveryRaceProcess(input: {
   instanceId: string;
   profileKey: string;
   registrationGeneration: string;
-  target: { chatId: number; threadId: number };
+  target: { chatId: number; threadId: number; slot: string };
 }): Promise<RegistrationRecoveryRaceResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -2563,7 +2563,7 @@ test("Replacement registration stays live while its process races dead-owner rec
       instanceId,
       profileKey: "manual:replacement-race",
       registrationGeneration: "replacement-race:generation-1",
-      target: { chatId: 7, threadId: 45 },
+      target: { chatId: 7, threadId: 45, slot: "A" },
     });
     assert.deepEqual(result, {
       phase: "result",
@@ -3578,6 +3578,7 @@ test("Extension runtime sends proactive checkpoints and final once in source ord
       },
       ctx,
     );
+    await flushMicrotasks(20);
     assert.equal(sentBodies.length, 2);
     assert.deepEqual(
       sentBodies.map((body) => body.chat_id),

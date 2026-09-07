@@ -20,6 +20,7 @@ import {
   buildTelegramCommandAction,
   isTelegramReservedCommandName,
   formatTelegramCommandEmojiPrefix,
+  formatTelegramPiCommandHtml,
   createTelegramAppMenuHtmlBuilder,
   createTelegramBotCommandRegistrar,
   createTelegramCommandControlEnqueueAdapter,
@@ -42,6 +43,7 @@ import {
   handleTelegramStatusCommand,
   handleTelegramStopCommand,
   parseTelegramCommand,
+  parseTelegramRequestedThreadName,
   registerTelegramBotCommands,
   registerTelegramCommand,
   registerTelegramBridgeCommands,
@@ -103,6 +105,24 @@ test("Command helpers expose Telegram bot command definitions", () => {
   assert.deepEqual(TELEGRAM_COMMAND_EMOJI.model, "🤖");
   assert.deepEqual(TELEGRAM_COMMAND_EMOJI.thinking, "🧠");
   assert.equal(formatTelegramCommandEmojiPrefix("model"), "🤖 ");
+  assert.equal(
+    formatTelegramPiCommandHtml("/telegram-connect <profile>"),
+    "<code>/telegram-connect &lt;profile&gt;</code>",
+  );
+  for (const command of [
+    "start",
+    "compact",
+    "next",
+    "continue",
+    "abort",
+    "stop",
+  ]) {
+    assert.match(TELEGRAM_APP_MENU_INTRO_HTML, new RegExp(` /${command} —`));
+  }
+  assert.doesNotMatch(
+    TELEGRAM_APP_MENU_INTRO_HTML,
+    /<code>\/(?:start|compact|next|continue|abort|stop)<\/code>/,
+  );
   const expectedBuiltins = [
     {
       command: "start",
@@ -288,6 +308,103 @@ test("Command helpers register pi setup and status commands", async () => {
   );
   assert.deepEqual(events, ["setup"]);
   assert.deepEqual(notifications, ["bot: @demo\npolling: stopped"]);
+  assert.equal(harness.commands.has("telegram-name"), true);
+});
+
+test("Connect requests an optional fresh Workspace Thread name", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const starts: Array<Record<string, unknown> | undefined> = [];
+  const activations: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async (_ctx, options) => {
+      starts.push(options as Record<string, unknown> | undefined);
+      return { ok: true };
+    },
+    stopPolling: async () => {},
+    updateStatus: () => {},
+    activateDefaultProfileConfig: async () => {
+      activations.push("default");
+    },
+    activateProfileConfig: async (_ctx, profileName) => {
+      activations.push(profileName);
+      return true;
+    },
+  });
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  const ctx = createBridgeCommandContext();
+
+  await connect.handler("as=Flightprice", ctx);
+  await connect.handler("work as=Navigator", ctx);
+
+  assert.deepEqual(activations, ["default", "work"]);
+  assert.equal(starts[0]?.requestedThreadName, "Flightprice");
+  assert.equal(starts[1]?.requestedThreadName, "Navigator");
+  assert.equal(parseTelegramRequestedThreadName("work as=Navigator"), "Navigator");
+});
+
+test("Connect rejects an invalid requested Workspace Thread name before startup", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const notifications: string[] = [];
+  let starts = 0;
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {
+      starts += 1;
+    },
+    stopPolling: async () => {},
+    validateThreadName: (threadName) =>
+      threadName === "bad-name" ? "Invalid Workspace Thread name." : undefined,
+    updateStatus: () => {},
+  });
+
+  const connect = getRequiredCommand(harness.commands, "telegram-connect");
+  const ctx = createBridgeCommandContext((message) =>
+    notifications.push(message),
+  );
+  await connect.handler("as=bad-name", ctx);
+  await connect.handler("as=", ctx);
+  await connect.handler("as=Navigator as=Voyager", ctx);
+
+  assert.equal(starts, 0);
+  assert.deepEqual(notifications, [
+    "Invalid Workspace Thread name.",
+    "Usage: /telegram-connect [profile] as=Flightprice",
+    "Specify at most one as=Name Workspace Thread name.",
+  ]);
+});
+
+test("telegram-name validates and saves the named-mode Workspace identity", async () => {
+  const harness = createCommandRegistrationApiHarness();
+  const renamed: string[] = [];
+  const notifications: string[] = [];
+  registerTelegramBridgeCommands(harness.api, {
+    promptForConfig: async () => {},
+    getStatusLines: () => [],
+    reloadConfig: async () => {},
+    hasBotToken: () => true,
+    startPolling: async () => {},
+    stopPolling: async () => {},
+    renameCurrentThread: async (threadName) => {
+      renamed.push(threadName);
+      return { ok: true, threadName };
+    },
+    updateStatus: () => {},
+  });
+
+  await getRequiredCommand(harness.commands, "telegram-name").handler(
+    "Flightprice",
+    createBridgeCommandContext((message) => notifications.push(message)),
+  );
+
+  assert.deepEqual(renamed, ["Flightprice"]);
+  assert.deepEqual(notifications, ["Telegram Workspace name saved as Flightprice."]);
 });
 
 test("Bare and explicit default setup/connect commands select the same profile", async () => {

@@ -31,6 +31,7 @@ import {
   createUnauthorizedBusAck,
   getTelegramBusProtocolCompatibility,
   getTelegramBusSocketPath,
+  hasTelegramBusCapability,
   isTelegramBusEnvelopeAuthorized,
   resolveTelegramBusSocketPath,
   sendTelegramBusLocalEnvelope,
@@ -39,11 +40,19 @@ import {
   type TelegramBusEnvelope,
   type TelegramBusProtocolIdentity,
   type TelegramBusSocketPathSource,
+  TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
+  TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE,
 } from "./bus.ts";
+import type { TelegramThreadDisplayMode } from "./config.ts";
 import {
   getTelegramBusTransportRetryPolicy,
   TELEGRAM_BUS_REGISTRATION_RETRY,
 } from "./bus-transport.ts";
+import {
+  createTelegramWorkspaceAdmissionOperationId,
+  runWithTelegramWorkspaceAdmissionsAsync,
+  type TelegramWorkspaceAdmissionLedger,
+} from "./workspace-admission.ts";
 
 export const TELEGRAM_BUS_FOLLOWER_PROMOTION_GRACE_MS = 2_500;
 export const TELEGRAM_FOLLOWER_SESSION_HANDOFF_TTL_MS = 30_000;
@@ -109,10 +118,16 @@ export interface TelegramBusFollowerRegistrationRuntime<TContext> {
   registerWithLeader: (
     ctx: TContext,
     leader: { busSocketPath?: string; busSecret?: string },
-    options?: { target?: TelegramTarget; previousInstanceId?: string },
+    options?: {
+      target?: TelegramTarget;
+      previousInstanceId?: string;
+      restoreWorkspace?: boolean;
+    },
   ) => Promise<boolean>;
   setContext: (ctx: TContext) => void;
   disconnectFromLeader?: () => Promise<boolean>;
+  renameThread?: (threadName: string) => Promise<string>;
+  setThreadDisplayMode?: (mode: TelegramThreadDisplayMode) => Promise<void>;
   stop: () => void;
 }
 
@@ -168,6 +183,8 @@ export interface TelegramBusFollowerRegistrationState {
   getTarget: () => TelegramTarget | undefined;
   getSlot: () => string | undefined;
   getThreadName: () => string | undefined;
+  getDisplayTitle: () => string | undefined;
+  setDisplayTitle: (title: string, generation: string) => boolean;
   getGeneration: () => string | undefined;
   beginRecovery: () => number;
   cancelRecovery: () => void;
@@ -279,6 +296,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   ) => void;
   onHeartbeatFailure?: (error: unknown, ctx: TContext) => Promise<void> | void;
   onRegistered?: (ctx: TContext) => Promise<void> | void;
+  onDisplayTitleChanged?: (ctx: TContext) => void;
 }
 
 export function createTelegramManualFollowerProfileKeyResolver(input: {
@@ -303,6 +321,43 @@ export type TelegramBusFollowerPromotionHandler<TContext> = (
   election: TelegramBusFollowerElection,
 ) => Promise<boolean>;
 
+type TelegramBusFollowerWorkspaceAdmissionDeps = {
+  getWorkspaceAdmission?: () => Pick<
+    TelegramWorkspaceAdmissionLedger,
+    "acquireAdmission" | "releaseAdmission"
+  > | undefined;
+  recordRuntimeEvent?: (
+    category: string,
+    error: unknown,
+    details?: Record<string, unknown>,
+  ) => void;
+};
+
+function runTelegramBusFollowerWorkspaceMutation<T>(
+  deps: TelegramBusFollowerWorkspaceAdmissionDeps,
+  operationKind: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (!deps.getWorkspaceAdmission) return operation();
+  const admission = deps.getWorkspaceAdmission();
+  if (!admission) {
+    throw new Error("Telegram Workspace admission authority is unavailable.");
+  }
+  return runWithTelegramWorkspaceAdmissionsAsync({
+    ledger: admission,
+    operationId: createTelegramWorkspaceAdmissionOperationId(),
+    operationKind,
+    scopes: [{ kind: "profile" }],
+    operation,
+    onReleaseError(error) {
+      deps.recordRuntimeEvent?.("bus", error, {
+        phase: "workspace-admission-release",
+        operationKind,
+      });
+    },
+  });
+}
+
 export function createTelegramBusFollowerPromotionHandler<
   TContext extends { cwd: string },
 >(input: {
@@ -321,66 +376,82 @@ export function createTelegramBusFollowerPromotionHandler<
   ) => void;
   getNowMs?: () => number;
   getPid?: () => number;
+  getWorkspaceAdmission?:
+    TelegramBusFollowerWorkspaceAdmissionDeps["getWorkspaceAdmission"];
 }): TelegramBusFollowerPromotionHandler<TContext> {
-  return async (ctx, binding, election) => {
-    const promoted = await input.startLeader(ctx, election, async () => {
-      const promotedRecord =
-        await Threads.promoteTelegramFollowerBindingToLeader({
-          store: input.topicTargetStore,
-          instanceId: input.instanceId,
+  return (ctx, binding, election) => runTelegramBusFollowerWorkspaceMutation(
+    input,
+    "workspace.promote-follower",
+    async () => {
+      let promotedRecord: Threads.TelegramTopicTargetRecord | undefined;
+      const promoted = await input.startLeader(ctx, election, async () => {
+        promotedRecord =
+          await Threads.promoteTelegramFollowerBindingToLeader({
+            store: input.topicTargetStore,
+            instanceId: input.instanceId,
+            cwd: ctx.cwd,
+            telegramProfile: input.getActiveProfileName(),
+            target: binding.target,
+            slot: binding.slot,
+            threadName: binding.threadName,
+          });
+        if (!promotedRecord && typeof binding.target?.threadId === "number") {
+          throw new Error(
+            "Telegram follower promotion slot authority is unavailable.",
+          );
+        }
+        if (promotedRecord) {
+          input.recordRuntimeEvent(
+            "bus",
+            "Follower thread binding promoted to leader",
+            {
+              phase: "follower-promoted-binding",
+              chatId: promotedRecord.target.chatId,
+              threadId: promotedRecord.target.threadId,
+              slot: promotedRecord.slot,
+              threadName: promotedRecord.threadName,
+            },
+          );
+        }
+      });
+      if (
+        promoted &&
+        promotedRecord &&
+        typeof binding.target?.threadId === "number"
+      ) {
+        const profileKey = Threads.getTelegramThreadOwnerKey({
+          kind: "leader",
           cwd: ctx.cwd,
+          instanceId: input.instanceId,
           telegramProfile: input.getActiveProfileName(),
-          target: binding.target,
-          slot: binding.slot,
-          threadName: binding.threadName,
         });
-      if (promotedRecord) {
+        Threads.setTelegramLeaderSessionHandoff({
+          pid: input.getPid?.() ?? process.pid,
+          instanceId: input.instanceId,
+          createdAtMs: input.getNowMs?.() ?? Date.now(),
+          profileKey,
+          target: {
+            chatId: binding.target.chatId,
+            threadId: binding.target.threadId,
+          },
+          slot: promotedRecord.slot,
+          threadName: promotedRecord.threadName,
+        });
         input.recordRuntimeEvent(
           "bus",
-          "Follower thread binding promoted to leader",
+          "Promoted leader binding retained for session replacement",
           {
-            phase: "follower-promoted-binding",
-            chatId: promotedRecord.target.chatId,
-            threadId: promotedRecord.target.threadId,
+            phase: "follower-promoted-session-handoff",
+            chatId: binding.target.chatId,
+            threadId: binding.target.threadId,
             slot: promotedRecord.slot,
             threadName: promotedRecord.threadName,
           },
         );
       }
-    });
-    if (promoted && typeof binding.target?.threadId === "number") {
-      const profileKey = Threads.getTelegramThreadOwnerKey({
-        kind: "leader",
-        cwd: ctx.cwd,
-        instanceId: input.instanceId,
-        telegramProfile: input.getActiveProfileName(),
-      });
-      Threads.setTelegramLeaderSessionHandoff({
-        pid: input.getPid?.() ?? process.pid,
-        instanceId: input.instanceId,
-        createdAtMs: input.getNowMs?.() ?? Date.now(),
-        profileKey,
-        target: {
-          chatId: binding.target.chatId,
-          threadId: binding.target.threadId,
-        },
-        slot: binding.slot,
-        threadName: binding.threadName,
-      });
-      input.recordRuntimeEvent(
-        "bus",
-        "Promoted leader binding retained for session replacement",
-        {
-          phase: "follower-promoted-session-handoff",
-          chatId: binding.target.chatId,
-          threadId: binding.target.threadId,
-          slot: binding.slot,
-          threadName: binding.threadName,
-        },
-      );
-    }
-    return promoted;
-  };
+      return promoted;
+    },
+  );
 }
 
 export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
@@ -390,7 +461,7 @@ export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
   >;
   registrationState: Pick<
     TelegramBusFollowerRegistrationState,
-    "getTarget" | "setRegistered" | "getGeneration"
+    "getTarget" | "getSlot" | "setRegistered" | "getGeneration"
   >;
   instanceId: string;
   getManualFollowerProfileKey: () => string;
@@ -404,6 +475,7 @@ export interface TelegramBusFollowerTargetReplacementHandlerDeps<TContext> {
     error: unknown,
     details?: Record<string, unknown>,
   ) => void;
+  getWorkspaceAdmission?: TelegramBusFollowerWorkspaceAdmissionDeps["getWorkspaceAdmission"];
 }
 
 export type TelegramBusFollowerLeaderState =
@@ -568,83 +640,106 @@ export function createTelegramBusFollowerTargetReplacementHandler<TContext>(
   TelegramBusForwardedUpdateReceiverRuntimeDeps<TContext>["handleReplaceTarget"]
 > {
   const getNowMs = deps.getNowMs ?? Date.now;
-  return async (input, ctx) => {
-    const assertCurrent = (expectedTarget = input.oldTarget): void => {
-      const target = deps.registrationState.getTarget();
-      if (!input.registrationGeneration ||
-        deps.registrationState.getGeneration() !== input.registrationGeneration ||
-        !input.oldTarget || !expectedTarget || target?.chatId !== expectedTarget.chatId ||
-        target.threadId !== expectedTarget.threadId ||
-        input.target.chatId !== input.oldTarget.chatId ||
-        input.target.threadId === input.oldTarget.threadId) {
-        throw new Error("Stale Telegram follower target replacement authority.");
+  return (input, ctx) => runTelegramBusFollowerWorkspaceMutation(
+    deps,
+    "workspace.replace-follower-target",
+    async () => {
+      const assertCurrent = (expectedTarget = input.oldTarget): void => {
+        const target = deps.registrationState.getTarget();
+        if (
+          !input.registrationGeneration ||
+          deps.registrationState.getGeneration() !==
+            input.registrationGeneration ||
+          !input.oldTarget ||
+          !expectedTarget ||
+          target?.chatId !== expectedTarget.chatId ||
+          target.threadId !== expectedTarget.threadId ||
+          input.target.chatId !== input.oldTarget.chatId ||
+          input.target.threadId === input.oldTarget.threadId
+        ) {
+          throw new Error(
+            "Stale Telegram follower target replacement authority.",
+          );
+        }
+      };
+      assertCurrent();
+      await deps.topicTargetStore.load();
+      assertCurrent();
+      const nowMs = getNowMs();
+      const currentRecord = Threads.findCurrentTelegramInstanceThreadRecord({
+        records: deps.topicTargetStore.list(),
+        instanceId: deps.instanceId,
+        preferredTarget: input.oldTarget,
+      });
+      if (
+        currentRecord &&
+        (currentRecord.target.chatId !== input.oldTarget!.chatId ||
+          currentRecord.target.threadId !== input.oldTarget!.threadId)
+      ) {
+        throw new Error("Stale Telegram follower binding replacement target.");
       }
-    };
-    assertCurrent();
-    await deps.topicTargetStore.load();
-    assertCurrent();
-    const nowMs = getNowMs();
-    const currentRecord = Threads.findCurrentTelegramInstanceThreadRecord({
-      records: deps.topicTargetStore.list(),
-      instanceId: deps.instanceId,
-      preferredTarget: input.oldTarget,
-    });
-    if (currentRecord && (currentRecord.target.chatId !== input.oldTarget!.chatId ||
-      currentRecord.target.threadId !== input.oldTarget!.threadId)) {
-      throw new Error("Stale Telegram follower binding replacement target.");
-    }
-    deps.topicTargetStore.markStaleByTarget(
-      input.oldTarget!,
-      "deleted",
-      "Follower thread was replaced by thread restore.",
-    );
-    const profileKey =
-      currentRecord?.profileKey ?? deps.getManualFollowerProfileKey();
-    deps.topicTargetStore.upsert({
-      profileKey,
-      owner: {
-        kind: "manual-follower",
-        instanceId: deps.manualFollowerOwnerId,
-      },
-      target: input.target,
-      status: "active",
-      syncStatus: "open",
-      createdAtMs: currentRecord?.createdAtMs ?? nowMs,
-      updatedAtMs: nowMs,
-      lastSyncObservedAtMs: nowMs,
-      lastReconcileAction: "follower-thread-restore",
-      instanceId: deps.instanceId,
-      slot: currentRecord?.slot,
-      threadName: currentRecord?.threadName,
-      rerouteConfirmedAtMs: nowMs,
-    });
-    deps.registrationState.setRegistered(true, input.target, {
-      slot: currentRecord?.slot,
-      threadName: currentRecord?.threadName,
-      generation: input.registrationGeneration,
-    });
-    await deps.topicTargetStore.persist();
-    assertCurrent(input.target);
-    deps.setSyncState(
-      Sync.markTelegramSyncSliceFresh(deps.getSyncState(), "target-bindings", {
-        nowMs,
-        action: "follower-thread-restore",
-      }),
-    );
-    deps.updateStatus(ctx);
-    deps.recordRuntimeEvent?.(
-      "bus",
-      "Telegram follower thread target replaced",
-      {
-        phase: "follower-thread-restore",
-        chatId: input.target.chatId,
-        threadId: input.target.threadId,
-        oldThreadId:
-          input.oldTarget?.threadId ?? currentRecord?.target.threadId,
-        slot: currentRecord?.slot,
-      },
-    );
-  };
+      const currentSlot =
+        currentRecord?.slot ?? deps.registrationState.getSlot();
+      if (!currentSlot || !/^[A-Z]$/u.test(currentSlot)) {
+        throw new Error("Telegram Thread slot authority is unavailable.");
+      }
+      deps.topicTargetStore.markStaleByTarget(
+        input.oldTarget!,
+        "deleted",
+        "Follower thread was replaced by thread restore.",
+      );
+      const profileKey =
+        currentRecord?.profileKey ?? deps.getManualFollowerProfileKey();
+      deps.topicTargetStore.upsert({
+        profileKey,
+        owner: {
+          kind: "manual-follower",
+          instanceId: deps.manualFollowerOwnerId,
+        },
+        target: input.target,
+        status: "active",
+        syncStatus: "open",
+        createdAtMs: currentRecord?.createdAtMs ?? nowMs,
+        updatedAtMs: nowMs,
+        lastSyncObservedAtMs: nowMs,
+        lastReconcileAction: "follower-thread-restore",
+        instanceId: deps.instanceId,
+        slot: currentSlot,
+        threadName: currentRecord?.threadName,
+        rerouteConfirmedAtMs: nowMs,
+      });
+      deps.registrationState.setRegistered(true, input.target, {
+        slot: currentSlot,
+        threadName: currentRecord?.threadName,
+        generation: input.registrationGeneration,
+      });
+      await deps.topicTargetStore.persist();
+      assertCurrent(input.target);
+      deps.setSyncState(
+        Sync.markTelegramSyncSliceFresh(
+          deps.getSyncState(),
+          "target-bindings",
+          {
+            nowMs,
+            action: "follower-thread-restore",
+          },
+        ),
+      );
+      deps.updateStatus(ctx);
+      deps.recordRuntimeEvent?.(
+        "bus",
+        "Telegram follower thread target replaced",
+        {
+          phase: "follower-thread-restore",
+          chatId: input.target.chatId,
+          threadId: input.target.threadId,
+          oldThreadId:
+            input.oldTarget?.threadId ?? currentRecord?.target.threadId,
+          slot: currentSlot,
+        },
+      );
+    },
+  );
 }
 
 export function createTelegramBusFollowerClientRuntime<
@@ -1109,6 +1204,7 @@ export function createTelegramBusFollowerRegistrationState(
   let target: TelegramTarget | undefined;
   let slot: string | undefined;
   let threadName: string | undefined;
+  let displayTitle: string | undefined;
   let generation: string | undefined;
   let leaderProtocol: TelegramBusProtocolIdentity | undefined;
   let eligibleElectionSlots: string[] = [];
@@ -1131,6 +1227,13 @@ export function createTelegramBusFollowerRegistrationState(
     getTarget: () => (target ? { ...target } : undefined),
     getSlot: () => slot,
     getThreadName: () => threadName,
+    getDisplayTitle: () => displayTitle,
+    setDisplayTitle(title, expectedGeneration) {
+      if (!registered || !generation || expectedGeneration !== generation ||
+          !title.trim() || title.length > 128 || displayTitle === title) return false;
+      displayTitle = title;
+      return true;
+    },
     getGeneration: () => generation,
     beginRecovery: () => {
       if (activeRecoveryEpoch !== undefined) return activeRecoveryEpoch;
@@ -1169,11 +1272,16 @@ export function createTelegramBusFollowerRegistrationState(
       ).sort();
     },
     setRegistered: (next, nextTarget, metadata) => {
+      const retainedDisplayTitle = next && registered &&
+        generation === metadata?.generation &&
+        target?.chatId === nextTarget?.chatId && target?.threadId === nextTarget?.threadId
+        ? displayTitle : undefined;
       const availabilityChanged = registered !== next;
       registered = next;
       target = next ? (nextTarget ? { ...nextTarget } : undefined) : undefined;
       slot = next ? metadata?.slot : undefined;
       threadName = next ? metadata?.threadName : undefined;
+      displayTitle = retainedDisplayTitle;
       generation = next ? metadata?.generation : undefined;
       leaderProtocol =
         next && metadata?.leaderProtocol
@@ -1530,6 +1638,15 @@ export function createTelegramBusFollowerRegistrationRuntime<
             )
           : [];
         deps.registrationState?.setEligibleElectionSlots(slots);
+        if (typeof heartbeatResult?.displayTitle === "string" &&
+            deps.registrationState?.setDisplayTitle(heartbeatResult.displayTitle, registrationGeneration) &&
+            heartbeatContext) {
+          try {
+            deps.onDisplayTitleChanged?.(heartbeatContext);
+          } catch {
+            // Display refresh failure must not invalidate a successful heartbeat.
+          }
+        }
       }
       if (response?.kind === "bus.ack" && !response.ok) {
         throw new Error(
@@ -1596,7 +1713,11 @@ export function createTelegramBusFollowerRegistrationRuntime<
             previousInstanceId: pendingHandoff.instanceId,
           }
         : undefined;
-      const registrationOptions = options ?? pendingHandoffOptions;
+      const registrationOptions: {
+        target?: TelegramTarget;
+        previousInstanceId?: string;
+        restoreWorkspace?: boolean;
+      } | undefined = options ?? pendingHandoffOptions;
       const leaderSocketPath =
         leader.busSocketPath ??
         deps.getLeaderSocketPath?.() ??
@@ -1607,11 +1728,10 @@ export function createTelegramBusFollowerRegistrationRuntime<
         : leader?.busSecret;
       deps.setActiveAuthSecret?.(activeAuthSecret);
       const registrationGeneration = deps.createRequestId();
-      const registrationEnvelope: Extract<
-        TelegramBusEnvelope,
-        { kind: "follower.register" }
-      > = {
-        kind: "follower.register",
+      const registrationEnvelope: TelegramBusEnvelope = {
+        kind: registrationOptions?.restoreWorkspace
+          ? "follower.restoreWorkspace"
+          : "follower.register",
         requestId: registrationGeneration,
         auth: activeAuthSecret,
         registration: {
@@ -1705,6 +1825,10 @@ export function createTelegramBusFollowerRegistrationRuntime<
         deps.registrationState?.setRegistered(false);
         deps.setActiveAuthSecret?.(undefined);
         await deps.stopReceiving?.();
+        if (
+          registrationOptions?.restoreWorkspace &&
+          response.error?.code === "workspace-binding-unavailable"
+        ) return false;
         throw new Error(
           response.message ??
             "Telegram bus follower registration was rejected.",
@@ -1758,6 +1882,107 @@ export function createTelegramBusFollowerRegistrationRuntime<
     },
     setContext(ctx) {
       activeContext = ctx;
+    },
+    async setThreadDisplayMode(mode) {
+      const socketPath = activeLeaderSocketPath;
+      const generation = activeRegistrationGeneration;
+      const auth = activeAuthSecret;
+      if (!socketPath || !generation || !deps.registrationState?.isRegistered()) {
+        throw new Error("Telegram follower is not registered with the leader.");
+      }
+      if (!hasTelegramBusCapability(deps.protocolIdentity, TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE) ||
+          !hasTelegramBusCapability(deps.registrationState.getLeaderProtocol(), TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE)) {
+        throw new Error("The Telegram peers do not support Thread display settings. Update or restart both instances.");
+      }
+      const requestId = deps.createRequestId();
+      const response = await sendTelegramBusLocalEnvelope({
+        socketPath, timeoutMs: registrationTimeoutMs,
+        envelope: {
+          kind: "follower.setThreadDisplayMode", requestId, auth,
+          instanceId: deps.instanceId, registrationGeneration: generation, mode,
+        },
+      });
+      if (activeLeaderSocketPath !== socketPath || activeRegistrationGeneration !== generation ||
+          activeAuthSecret !== auth || deps.registrationState.getGeneration() !== generation) {
+        throw new Error("Telegram Thread display setting completed for a stale registration.");
+      }
+      if (response?.kind !== "bus.ack" || !response.ok || response.requestId !== requestId ||
+          !isRecord(response.result) || response.result.mode !== mode) {
+        throw new Error(response?.kind === "bus.ack"
+          ? response.message ?? "Telegram Thread display setting was rejected."
+          : "Telegram Thread display setting was not acknowledged.");
+      }
+    },
+    async renameThread(threadName) {
+      if (!activeLeaderSocketPath || !activeRegistrationGeneration) {
+        throw new Error("Telegram follower is not registered with the leader.");
+      }
+      if (
+        deps.registrationState &&
+        !hasTelegramBusCapability(
+          deps.registrationState.getLeaderProtocol(),
+          TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME,
+        )
+      ) {
+        throw new Error(
+          "The active Telegram leader does not support Workspace Thread rename. Update or restart that Pi instance.",
+        );
+      }
+      const expectedLeaderSocketPath = activeLeaderSocketPath;
+      const expectedRegistrationGeneration = activeRegistrationGeneration;
+      const expectedAuthSecret = activeAuthSecret;
+      const response = await sendTelegramBusLocalEnvelope({
+        socketPath: expectedLeaderSocketPath,
+        timeoutMs: registrationTimeoutMs,
+        retry: getTelegramBusTransportRetryPolicy({
+          endpoint: expectedLeaderSocketPath,
+          operation: "operation",
+        }),
+        envelope: {
+          kind: "follower.renameThread",
+          requestId: deps.createRequestId(),
+          auth: expectedAuthSecret,
+          instanceId: deps.instanceId,
+          registrationGeneration: expectedRegistrationGeneration,
+          threadName,
+          sentAtMs: getNowMs(),
+        },
+      });
+      if (response?.kind !== "bus.ack" || !response.ok) {
+        throw new Error(
+          response?.kind === "bus.ack"
+            ? (response.message ?? "Telegram Workspace Thread rename was rejected.")
+            : "Telegram Workspace Thread rename was not acknowledged.",
+        );
+      }
+      if (
+        activeLeaderSocketPath !== expectedLeaderSocketPath ||
+        activeRegistrationGeneration !== expectedRegistrationGeneration ||
+        (deps.registrationState &&
+          deps.registrationState.getGeneration() !==
+            expectedRegistrationGeneration)
+      ) {
+        throw new Error(
+          "Telegram Workspace Thread rename completed for a stale follower registration.",
+        );
+      }
+      const renamedThreadName =
+        response.result &&
+        typeof response.result === "object" &&
+        "threadName" in response.result &&
+        typeof response.result.threadName === "string"
+          ? response.result.threadName
+          : threadName;
+      const target = deps.registrationState?.getTarget();
+      if (deps.registrationState && target) {
+        deps.registrationState.setRegistered(true, target, {
+          slot: deps.registrationState.getSlot(),
+          threadName: renamedThreadName,
+          generation: expectedRegistrationGeneration,
+          leaderProtocol: deps.registrationState.getLeaderProtocol(),
+        });
+      }
+      return renamedThreadName;
     },
     async disconnectFromLeader() {
       if (!activeLeaderSocketPath || !activeRegistrationGeneration) {

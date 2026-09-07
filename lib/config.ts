@@ -83,6 +83,36 @@ export interface ResolvedTelegramTimeConfig {
   timezone: string;
 }
 
+export type TelegramThreadDisplayMode = "letters" | "names" | "directories";
+
+export function resolveTelegramThreadDisplayMode(
+  config: Pick<TelegramConfig, "threadDisplayMode">,
+): TelegramThreadDisplayMode {
+  return config.threadDisplayMode === "letters" ||
+    config.threadDisplayMode === "directories"
+    ? config.threadDisplayMode
+    : "names";
+}
+
+export async function setTelegramThreadDisplayMode(
+  store: TelegramConfigStore,
+  mode: TelegramThreadDisplayMode,
+  isCurrent: () => boolean,
+): Promise<void> {
+  if (!["letters", "names", "directories"].includes(mode)) {
+    throw new Error("Invalid Telegram Thread display mode.");
+  }
+  const profile = store.getActiveProfileName();
+  const current = () => isCurrent() && store.getActiveProfileName() === profile;
+  if (!current()) throw new Error("Telegram Thread display setting lost authority.");
+  await store.load();
+  if (!current() || !store.hasBotToken()) {
+    throw new Error("Telegram Thread display setting lost its configured profile.");
+  }
+  await store.persist({ ...store.get(), threadDisplayMode: mode }, { isCurrent: current });
+  if (!current()) throw new Error("Telegram Thread display setting changed during persistence.");
+}
+
 export type TelegramAssistantRenderingMode = "rich" | "html";
 export type TelegramActivityVerbosity =
   | "quiet"
@@ -99,6 +129,8 @@ export interface TelegramConfig {
   botId?: number;
   /** @deprecated persisted identity belongs in profiles.default; retained for effective/legacy views */
   allowedUserId?: number;
+  /** Effective view; persisted under profiles.<name>. */
+  threadDisplayMode?: TelegramThreadDisplayMode;
   inboundHandlers?: TelegramInboundHandlerConfig[];
   attachmentHandlers?: TelegramInboundHandlerConfig[];
   outboundHandlers?: TelegramOutboundHandlerConfig[];
@@ -130,7 +162,7 @@ export interface TelegramConfig {
 }
 
 /**
- * Per-profile bot/session identity fields.
+ * Per-profile bot/session identity and Thread display preference.
  * Stored under `profiles.<name>` in telegram.json.
  * Shared bridge settings (inboundHandlers, outboundHandlers, voice, time,
  * assistant) stay at the top level.
@@ -140,6 +172,7 @@ export interface TelegramBotProfile {
   botUsername?: string;
   botId?: number;
   allowedUserId?: number;
+  threadDisplayMode?: TelegramThreadDisplayMode;
 }
 
 interface TelegramLegacyCursorCarrier {
@@ -184,7 +217,7 @@ export interface TelegramConfigStore {
   setAllowedUserId: (userId: number) => void;
   load: () => Promise<void>;
   didLastLoadRecoverInvalidConfig: () => boolean;
-  persist: (config?: TelegramConfig) => Promise<void>;
+  persist: (config?: TelegramConfig, options?: { isCurrent?: () => boolean }) => Promise<void>;
 }
 
 export function createTelegramConfigBotIdGetter(
@@ -437,6 +470,9 @@ export function getTelegramProfileFields(
     ...(config.allowedUserId !== undefined
       ? { allowedUserId: config.allowedUserId }
       : {}),
+    ...(config.threadDisplayMode !== undefined
+      ? { threadDisplayMode: config.threadDisplayMode }
+      : {}),
     ...(legacyCursor !== undefined ? { lastUpdateId: legacyCursor } : {}),
   };
 }
@@ -447,6 +483,7 @@ function omitTelegramRootProfileFields(config: TelegramConfig): TelegramConfig {
     botUsername: _botUsername,
     botId: _botId,
     allowedUserId: _allowedUserId,
+    threadDisplayMode: _threadDisplayMode,
     lastUpdateId: _lastUpdateId,
     ...sharedConfig
   } = config as TelegramConfig & TelegramLegacyCursorCarrier;
@@ -484,6 +521,7 @@ export function normalizeTelegramDefaultProfileConfig(config: TelegramConfig): {
     "botUsername",
     "botId",
     "allowedUserId",
+    "threadDisplayMode",
     "lastUpdateId",
   ].some((field) => Object.hasOwn(config, field));
   if (!hasLegacyRootProfile) {
@@ -503,6 +541,9 @@ export function normalizeTelegramDefaultProfileConfig(config: TelegramConfig): {
     ...(config.botId !== undefined ? { botId: config.botId } : {}),
     ...(config.allowedUserId !== undefined
       ? { allowedUserId: config.allowedUserId }
+      : {}),
+    ...(config.threadDisplayMode !== undefined
+      ? { threadDisplayMode: config.threadDisplayMode }
       : {}),
     ...((config as TelegramConfig & TelegramLegacyCursorCarrier)
       .lastUpdateId !== undefined
@@ -693,7 +734,7 @@ export function createTelegramConfigStore(
       mutationVersion += 1;
     },
     didLastLoadRecoverInvalidConfig: () => lastLoadRecoveredInvalidConfig,
-    persist: (nextConfig = getEffectiveConfig()) => {
+    persist: (nextConfig = getEffectiveConfig(), options) => {
       const profileName = activeProfileName;
       const desiredConfig = storeTelegramEffectiveConfig(
         config,
@@ -706,6 +747,9 @@ export function createTelegramConfigStore(
         const mergedConfig = withTelegramFileTransaction(
           `${configPath}.transaction`,
           () => {
+            if (options?.isCurrent && !options.isCurrent()) {
+              throw new Error("Telegram config update lost its originating authority.");
+            }
             const latestConfig = readTelegramConfigForTransaction(configPath);
             const merged = mergeTelegramConfigDelta(
               baseConfig as Record<string, unknown>,

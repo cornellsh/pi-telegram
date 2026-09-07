@@ -294,6 +294,7 @@ export interface TelegramStatusBarState {
   pollingStopReason?: string;
   paired: boolean;
   busRole?: TelegramBridgeBusRole;
+  followerRegistered?: boolean;
   busLifecyclePhase?: TelegramBridgeBusLifecyclePhase;
   instanceSlot?: string;
   instanceThreadName?: string;
@@ -677,11 +678,13 @@ export function createTelegramBridgeStatusRuntime<
       const hasPendingModelSwitch = deps.hasPendingModelSwitch();
       const activeToolExecutions = deps.getActiveToolExecutions();
       const compactionInProgress = deps.isCompactionInProgress();
+      const localBus = deps.getLocalBus?.();
       return {
         hasBotToken: !!config.botToken,
         pollingActive: deps.isPollingActive(),
         paired: !!config.allowedUserId,
         busRole: deps.getBusRole?.(),
+        followerRegistered: localBus?.followerRegistered,
         busLifecyclePhase: deps.getBusLifecyclePhase?.(),
         instanceSlot: deps.getInstanceSlot?.(),
         instanceThreadName: deps.getInstanceThreadName?.(),
@@ -901,6 +904,9 @@ export function buildTelegramStatusBarText(
     return `${theme.fg("accent", "telegram")} ${theme.fg("dim", "disconnected")}${queued}`;
   if (state.error) {
     return `${label} ${theme.fg("error", "error")}`;
+  }
+  if (state.busRole === "follower" && state.followerRegistered === false) {
+    return `${label} ${theme.fg("warning", "reconnecting")}${queued}`;
   }
   if (state.processing) {
     const processingStatus = state.queuedStatus

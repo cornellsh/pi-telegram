@@ -16,6 +16,7 @@ import {
   statSync,
   unlinkSync,
   writeFileSync,
+  type Dirent,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -28,7 +29,15 @@ import {
   getTelegramProcessLiveness,
   type TelegramProcessLiveness,
 } from "./bus.ts";
-import { TELEGRAM_DEFAULT_PROFILE_NAME } from "./paths.ts";
+import {
+  getTelegramProfilePathSuffix,
+  TELEGRAM_DEFAULT_PROFILE_NAME,
+} from "./paths.ts";
+import {
+  runWithTelegramWorkspaceAdmissions,
+  type TelegramWorkspaceAdmissionLedger,
+  type TelegramWorkspaceAdmissionScope,
+} from "./workspace-admission.ts";
 
 export const TELEGRAM_UPDATE_JOURNAL_VERSION = 1 as const;
 export const TELEGRAM_UPDATE_JOURNAL_MAX_ENTRIES = 10_000;
@@ -40,6 +49,56 @@ export const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_TOKEN_MIN_LENGTH = 32;
 export const TELEGRAM_UPDATE_JOURNAL_QUEUE_HANDOFF_TOKEN_MAX_LENGTH = 256;
 export const TELEGRAM_UPDATE_JOURNAL_FAILURE_CLASS_MAX_LENGTH = 128;
 export const TELEGRAM_UPDATE_JOURNAL_FAILURE_SUMMARY_MAX_LENGTH = 512;
+
+export interface TelegramFollowerJournalDiscovery {
+  paths: string[];
+  complete: boolean;
+}
+
+function escapeTelegramJournalPathPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+/** Read-only discovery for canonical follower journal snapshots and segment roots. */
+export function discoverTelegramFollowerJournalPaths(input: {
+  directory: string;
+  profileName?: string;
+}): TelegramFollowerJournalDiscovery {
+  const suffix = escapeTelegramJournalPathPattern(
+    getTelegramProfilePathSuffix(input.profileName),
+  );
+  const pattern = new RegExp(
+    `^(follower-inbox-[a-f0-9]{16}${suffix}\\.json)(?:\\.segments)?$`,
+    "u",
+  );
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(input.directory, { withFileTypes: true });
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { paths: [], complete: true }
+      : { paths: [], complete: false };
+  }
+  const paths = new Set<string>();
+  let complete = true;
+  for (const entry of entries) {
+    const match = pattern.exec(entry.name);
+    if (!match) continue;
+    const candidatePath = join(input.directory, entry.name);
+    const expectsDirectory = entry.name.endsWith(".segments");
+    try {
+      const stat = statSync(candidatePath);
+      if (expectsDirectory ? !stat.isDirectory() : !stat.isFile()) {
+        complete = false;
+        continue;
+      }
+      paths.add(join(input.directory, match[1]!));
+    } catch {
+      complete = false;
+    }
+  }
+  return { paths: Array.from(paths).sort(), complete };
+}
 export const TELEGRAM_UPDATE_JOURNAL_TERMINAL_REASON_MAX_LENGTH = 256;
 export const TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT = 256;
 export const TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_BYTES = 4 * 1024 * 1024;
@@ -80,6 +139,89 @@ export interface TelegramUpdateJournalInput {
 
 export type TelegramJournaledUpdate = TelegramUpdateJournalInput &
   Record<string, unknown>;
+
+const TELEGRAM_UPDATE_CHAT_CARRIERS = new Set([
+  "message",
+  "edited_message",
+  "channel_post",
+  "edited_channel_post",
+  "business_message",
+  "edited_business_message",
+  "message_reaction",
+  "message_reaction_count",
+  "my_chat_member",
+  "chat_member",
+  "chat_join_request",
+  "chat_boost",
+  "removed_chat_boost",
+  "deleted_business_messages",
+]);
+
+function getUpdateCarrierScope(
+  value: unknown,
+): TelegramWorkspaceAdmissionScope | undefined {
+  if (!isRecord(value) || !isRecord(value.chat)) return undefined;
+  const chatId = value.chat.id;
+  if (!Number.isSafeInteger(chatId) || chatId === 0) return undefined;
+  const threadId = value.message_thread_id;
+  if (threadId === undefined) return { kind: "chat", chatId: chatId as number };
+  if (!Number.isSafeInteger(threadId) || (threadId as number) <= 0) {
+    return undefined;
+  }
+  return {
+    kind: "target",
+    target: { chatId: chatId as number, threadId: threadId as number },
+  };
+}
+
+function getUpdateAdmissionScope(
+  update: TelegramUpdateJournalInput & Record<string, unknown>,
+): TelegramWorkspaceAdmissionScope {
+  const payloadKeys = Object.keys(update).filter((key) => key !== "update_id");
+  if (payloadKeys.length !== 1) return { kind: "profile" };
+  const payloadKey = payloadKeys[0];
+  if (TELEGRAM_UPDATE_CHAT_CARRIERS.has(payloadKey)) {
+    return getUpdateCarrierScope(update[payloadKey]) ?? { kind: "profile" };
+  }
+  if (payloadKey === "callback_query") {
+    const query = update.callback_query;
+    return isRecord(query)
+      ? getUpdateCarrierScope(query.message) ?? { kind: "profile" }
+      : { kind: "profile" };
+  }
+  return { kind: "profile" };
+}
+
+function getWorkspaceAdmissionScopeKey(
+  scope: TelegramWorkspaceAdmissionScope,
+): string {
+  if (scope.kind === "profile") return "profile";
+  if (scope.kind === "chat") return `chat:${scope.chatId}`;
+  return `target:${scope.target.chatId}:${scope.target.threadId}`;
+}
+
+export function getTelegramUpdateJournalAdmissionScopes(
+  updates: readonly (TelegramUpdateJournalInput & Record<string, unknown>)[],
+): TelegramWorkspaceAdmissionScope[] {
+  if (updates.length === 0) return [{ kind: "profile" }];
+  const scopes = updates.map(getUpdateAdmissionScope);
+  if (scopes.some((scope) => scope.kind === "profile")) {
+    return [{ kind: "profile" }];
+  }
+  const chatIds = new Set(
+    scopes
+      .filter((scope): scope is { kind: "chat"; chatId: number } => scope.kind === "chat")
+      .map((scope) => scope.chatId),
+  );
+  const unique = new Map<string, TelegramWorkspaceAdmissionScope>();
+  for (const scope of scopes) {
+    if (scope.kind === "target" && chatIds.has(scope.target.chatId)) continue;
+    unique.set(getWorkspaceAdmissionScopeKey(scope), scope);
+  }
+  return Array.from(unique.entries())
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, scope]) => scope);
+}
 
 export type TelegramUpdateJournalEntryState =
   | "pending"
@@ -371,6 +513,10 @@ export interface TelegramUpdateJournalStoreOptions {
   getQueueProcessLiveness?: (
     owner: TelegramUpdateJournalQueueProcessIdentity,
   ) => TelegramProcessLiveness;
+  workspaceAdmission?: Pick<
+    TelegramWorkspaceAdmissionLedger,
+    "acquireAdmission" | "releaseAdmission"
+  >;
   onPublicationBoundary?: (
     boundary: TelegramUpdateJournalPublicationBoundary,
     publicationPath: string,
@@ -1522,6 +1668,10 @@ export interface TelegramUpdateJournalRuntimeBindingResolverDeps {
   getBotId: () => number | undefined;
   getJournalPath: (profileName?: string) => string;
   getQueueRuntimeIdentity?: () => TelegramUpdateJournalQueueRuntimeIdentity;
+  getWorkspaceAdmission?: () => Pick<
+    TelegramWorkspaceAdmissionLedger,
+    "acquireAdmission" | "releaseAdmission"
+  > | undefined;
   onRecovery?: (event: TelegramUpdateJournalRecoveryEvent) => void;
 }
 
@@ -1539,6 +1689,7 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(
       botId: deps.getBotId(),
     });
     const path = deps.getJournalPath(configuredProfileName);
+    const workspaceAdmission = deps.getWorkspaceAdmission?.();
     return {
       runtimeKey: JSON.stringify({
         path,
@@ -1557,6 +1708,7 @@ export function createTelegramUpdateJournalRuntimeBindingResolver(
         ...(deps.getQueueRuntimeIdentity
           ? { queueRuntimeIdentity: deps.getQueueRuntimeIdentity() }
           : {}),
+        ...(workspaceAdmission ? { workspaceAdmission } : {}),
         ...(deps.onRecovery ? { onRecovery: deps.onRecovery } : {}),
       }),
     };
@@ -1570,6 +1722,9 @@ export interface TelegramUpdateJournalBindingRuntime {
   getActiveRecoveryKey: () => string | undefined;
   createRecipientResolver: (
     recipientBindingKey: string,
+  ) => () => TelegramUpdateJournalRuntimeBinding | undefined;
+  createPathResolver: (
+    path: string,
   ) => () => TelegramUpdateJournalRuntimeBinding | undefined;
 }
 
@@ -1598,6 +1753,9 @@ export function createTelegramUpdateJournalBindingRuntime(deps: {
       ...(includeQueueRuntimeIdentity && deps.base.getQueueRuntimeIdentity
         ? { getQueueRuntimeIdentity: deps.base.getQueueRuntimeIdentity }
         : {}),
+      ...(deps.base.getWorkspaceAdmission
+        ? { getWorkspaceAdmission: deps.base.getWorkspaceAdmission }
+        : {}),
       ...(deps.base.onRecovery ? { onRecovery: deps.base.onRecovery } : {}),
       getJournalPath(profileName) {
         return deps.getFollowerJournalPath(bindingKey, profileName);
@@ -1614,6 +1772,17 @@ export function createTelegramUpdateJournalBindingRuntime(deps: {
     getActiveRecoveryKey: () => resolveActive()?.recoveryKey,
     createRecipientResolver: (bindingKey) =>
       createFollowerResolver(bindingKey, false),
+    createPathResolver: (path) =>
+      createTelegramUpdateJournalRuntimeBindingResolver({
+        getProfileName: deps.base.getProfileName,
+        getBotToken: deps.base.getBotToken,
+        getBotId: deps.base.getBotId,
+        ...(deps.base.getWorkspaceAdmission
+          ? { getWorkspaceAdmission: deps.base.getWorkspaceAdmission }
+          : {}),
+        ...(deps.base.onRecovery ? { onRecovery: deps.base.onRecovery } : {}),
+        getJournalPath: () => path,
+      }),
   };
 }
 
@@ -1654,6 +1823,7 @@ export function createTelegramUpdateJournalStore(
   );
   const getNowMs = options.getNowMs ?? Date.now;
   const onPublicationBoundary = options.onPublicationBoundary;
+  const workspaceAdmission = options.workspaceAdmission;
   const notifyRecovery = (event: TelegramUpdateJournalRecoveryEvent): void => {
     try {
       options.onRecovery?.(event);
@@ -2327,7 +2497,7 @@ export function createTelegramUpdateJournalStore(
       });
     },
     appendBatch(updates, requestedAcceptedThroughUpdateId) {
-      return runMutation(() => {
+      const append = () => runMutation(() => {
         if (
           requestedAcceptedThroughUpdateId !== undefined &&
           !isSafeNonNegativeInteger(requestedAcceptedThroughUpdateId)
@@ -2456,6 +2626,21 @@ export function createTelegramUpdateJournalStore(
           entryCount: published.file.entries.length,
           serializedBytes: published.serializedBytes,
         };
+      });
+      if (!workspaceAdmission) return append();
+      const operationHash = createHash("sha256").update(path).update("\0");
+      for (const update of updates) {
+        operationHash.update(String(update.update_id)).update("\0");
+      }
+      operationHash.update(String(requestedAcceptedThroughUpdateId ?? "none"));
+      return runWithTelegramWorkspaceAdmissions({
+        ledger: workspaceAdmission,
+        operationId: `journal:${operationHash.digest("hex")}`,
+        operationKind: "journal.append",
+        scopes: getTelegramUpdateJournalAdmissionScopes(
+          updates as readonly TelegramJournaledUpdate[],
+        ),
+        operation: append,
       });
     },
     markQueued(receipt) {

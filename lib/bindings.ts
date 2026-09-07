@@ -498,6 +498,11 @@ interface TelegramCommandsAndToolsBindingDeps {
   stopPolling?: () => Promise<void | string>;
   recoverPollingStart?: Commands.TelegramBridgeCommandRegistrationDeps["recoverPollingStart"];
   getDisconnectThreadName?: () => string | undefined;
+  setRequestedThreadNameForPollingStart?: (
+    threadName: string | undefined,
+  ) => void;
+  validateThreadName?: Commands.TelegramBridgeCommandRegistrationDeps["validateThreadName"];
+  renameCurrentThread?: Commands.TelegramBridgeCommandRegistrationDeps["renameCurrentThread"];
   onTransportChanged?: () => Promise<void> | void;
   getStatusLines: (
     options?: Status.TelegramBridgeStatusLineOptions,
@@ -533,6 +538,9 @@ export function registerTelegramCommandsAndTools({
   stopPolling,
   recoverPollingStart,
   getDisconnectThreadName,
+  setRequestedThreadNameForPollingStart,
+  validateThreadName,
+  renameCurrentThread,
   onTransportChanged,
   getStatusLines,
   buttonActionStore,
@@ -636,7 +644,11 @@ export function registerTelegramCommandsAndTools({
               );
             }
             await configStore.load();
-            configStore.setProfile(profileName, profile);
+            const latestProfile = configStore.getStoredConfig().profiles?.[profileName];
+            configStore.setProfile(profileName, {
+              ...profile,
+              threadDisplayMode: latestProfile?.threadDisplayMode,
+            });
             configStore.activateProfile(profileName);
             await onTransportChanged?.();
             await persistConfig(configStore.get());
@@ -670,16 +682,21 @@ export function registerTelegramCommandsAndTools({
     reloadConfig: configStore.load,
     hasBotToken: configStore.hasBotToken,
     startPolling: async (ctx, options) => {
+      setRequestedThreadNameForPollingStart?.(options?.requestedThreadName);
       try {
         return await lockedPollingRuntime.start(ctx, options);
       } catch (error) {
         recordRuntimeEvent("recovery", error, { phase: "polling-start" });
         throw error;
+      } finally {
+        setRequestedThreadNameForPollingStart?.(undefined);
       }
     },
     stopPolling: stopPolling ?? lockedPollingRuntime.stop,
     recoverPollingStart,
     getDisconnectThreadName,
+    validateThreadName,
+    renameCurrentThread,
     queueAgentConnectionContext,
     updateStatus,
     getProfileNames: () =>

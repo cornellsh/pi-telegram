@@ -8,6 +8,7 @@ Small standard for inline buttons, menu rows, state controls, cards, and confirm
 - Put emoji where they help scanning, not everywhere.
 - Use one strong indicator for current selection; avoid emoji noise on every option.
 - Match label casing to control role.
+- Keep Telegram bot commands such as `/start` and `/abort` as plain text so clients expose their native command links; bot command names use Telegram-compatible characters and never hyphens. Render Pi TUI commands mentioned inside Telegram HTML, such as `<code>/telegram-connect</code>`, as code so Telegram does not mis-tokenize their hyphenated names; callback alerts remain plain because Telegram does not support rich formatting there.
 - Prefer minimal, clear configuration UI over exhaustive explanation.
 - Preserve domain-owned callback prefixes and behavior in the owning module.
 
@@ -19,7 +20,7 @@ Use emoji as stable semantic markers, not decoration. Emoji carry transportable 
 
 | Emoji | Meaning | Canonical surfaces | Notes |
 | --- | --- | --- | --- |
-| `🧵` | Telegram/Pi thread routing | Thread chooser headings, unbound-thread warnings, thread lifecycle/status copy | Canonical thread marker. Do not add it to every concrete target button; target buttons use `threadName` or slot fallback. |
+| `🧵` | Telegram/Pi thread routing | Thread chooser headings, unbound-thread warnings, thread lifecycle/status copy | Canonical thread marker. Do not add it to every concrete target button; target buttons use the acknowledged display title or stable-name fallback. |
 | `📡` | Telegram transport / bridge connection | Instance connected notices, polling/transport role, bridge online copy | Transport is not thread identity; use `🧵` for thread concepts. |
 | `📊` | Status / overview | `/status` command description, status cards or status rows | Use for status summaries, not queue priority. |
 | `🤖` | Model selection | `/model`, model menu headings, model status rows | Keep model-control surfaces visually distinct from thinking. |

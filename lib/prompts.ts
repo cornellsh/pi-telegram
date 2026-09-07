@@ -14,7 +14,7 @@ export const TELEGRAM_DISCONNECTED_CONTEXT_MESSAGE =
 
 const LOCAL_SYSTEM_PROMPT_SUFFIX = `
 
-${TELEGRAM_CONNECTED_CONTEXT_MESSAGE} For Telegram work, consult bundled Skills in routing order: \`telegram-bridge\` for the transport and turn protocol, \`generated-control-surface\` when contextual controls materially shorten feedback, then \`generative-apps\` when the interaction warrants a reusable deterministic app. Load a Skill only if its instructions are not already present in the current context. Do not use Telegram-specific features from unrelated local/TUI prompts.`;
+${TELEGRAM_CONNECTED_CONTEXT_MESSAGE} For Telegram work, consult bundled Skills in routing order: \`telegram-bridge\` for the transport and turn protocol, \`show-me\` when a user needs a truthful visual explanation of work or behavior, \`generated-control-surface\` when contextual controls materially shorten feedback, then \`generative-apps\` when the interaction warrants a reusable deterministic app. Load a Skill only if its instructions are not already present in the current context. Do not use Telegram-specific features from unrelated local/TUI prompts.`;
 
 const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 

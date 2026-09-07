@@ -87,6 +87,19 @@ export function getTelegramDiagnosticsDisplayPaths(profileName?: string): {
   };
 }
 
+/** Durable Workspace admission ledger (<agentDir>/tmp/telegram/workspace-admission[.<profile>].json). */
+export function resolveTelegramWorkspaceAdmissionPath(
+  agentDir = resolveAgentDir(),
+  profileName?: string,
+): string {
+  return resolveTelegramProfileTempFilePath(
+    "workspace-admission",
+    "json",
+    agentDir,
+    profileName,
+  );
+}
+
 /** Durable inbound update journal (<agentDir>/tmp/telegram/inbox[.<profile>].json). */
 export function resolveTelegramUpdateJournalPath(
   agentDir = resolveAgentDir(),

@@ -16,6 +16,8 @@ import {
   buildDraftPreviewsSettingsReplyMarkup,
   buildDraftPreviewsSettingsText,
   buildTelegramSettingsMenuReplyMarkup,
+  buildThreadDisplaySettingsReplyMarkup,
+  type TelegramSettingsMenuCallbackDeps,
   buildTelegramSettingsMenuText,
   buildTimeInjectionModeSettingsReplyMarkup,
   buildTimeInjectionModeSettingsText,
@@ -43,6 +45,47 @@ function getSettingsControlOrder(markup: {
       return button.callback_data.split(":").at(-1)!;
     });
 }
+
+test("Thread display Settings are ordered Letters, Names default, Directories and gate mutation", async () => {
+  const markup = buildThreadDisplaySettingsReplyMarkup("names");
+  const root = buildTelegramSettingsMenuReplyMarkup(true, "rich", "manual", "hidden", undefined, false, false, "verbose", "names");
+  assert.ok(root.inline_keyboard.flat().some((button) => button.callback_data === "settings:open:thread-display"));
+  const classic = buildTelegramSettingsMenuReplyMarkup(true, "rich", "manual", "hidden");
+  assert.equal(classic.inline_keyboard.flat().some((button) => button.callback_data === "settings:open:thread-display"), false);
+  assert.deepEqual(getSettingsControlOrder(markup), ["letters", "names", "directories"]);
+  assert.equal(markup.inline_keyboard[2][0].text, "🟢 Names (default)");
+  const calls: string[] = [];
+  let fail = false;
+  const deps: TelegramSettingsMenuCallbackDeps = {
+    getThreadDisplayMode: () => "names",
+    async setThreadDisplayMode(mode) { calls.push(`set:${mode}`); if (fail) throw new Error("partial failure"); },
+    areDraftPreviewsEnabled: () => true,
+    getAssistantRenderingMode: () => "rich", getActivityVerbosity: () => "verbose",
+    getTimeInjectionMode: () => "hidden", getVoiceReplyMode: () => "manual",
+    isVoiceReplyModeConfigured: () => false, isAutomaticThreadCleanupEnabled: () => false,
+    async setDraftPreviewsEnabled() {}, async setAssistantRenderingMode() {},
+    async setActivityVerbosity() {}, async setVoiceReplyMode() {},
+    async setTimeInjectionMode() {}, async setAutomaticThreadCleanupEnabled() {},
+    async updateSettingsMessage() { calls.push("update"); },
+    async answerCallbackQuery(_id, text) { calls.push(text ?? "ack"); },
+  };
+  await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:directories", deps);
+  assert.deepEqual(calls, ["set:directories", "update", "ack"]);
+  calls.length = 0;
+  fail = true;
+  await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:letters", deps);
+  assert.equal(calls.includes("update"), false);
+  assert.match(calls.at(-1)!, /not fully applied/);
+  calls.length = 0;
+  await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:invalid", deps);
+  assert.deepEqual(calls, ["Unknown Thread display mode."]);
+  calls.length = 0;
+  await handleTelegramSettingsMenuCallbackAction("q", "settings:set:thread-display:letters", {
+    ...deps, getThreadDisplayMode: () => undefined,
+  });
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /requires Threaded Mode/);
+});
 
 test("Settings descriptions follow visible control order", () => {
   const surfaces = [

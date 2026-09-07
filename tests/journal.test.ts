@@ -5,6 +5,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -26,6 +27,7 @@ import {
   createTelegramUpdateJournalBindingRuntime,
   createTelegramUpdateJournalBotIdentity,
   createTelegramUpdateQueueHandoffToken,
+  discoverTelegramFollowerJournalPaths,
   createTelegramUpdateJournalReceiptScope,
   createTelegramUpdateJournalReceiptScopeResolver,
   createTelegramUpdateJournalRuntimeBindingResolver,
@@ -34,13 +36,45 @@ import {
   TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_BYTES,
   TELEGRAM_UPDATE_JOURNAL_COMPACTION_SEGMENT_COUNT,
   createTelegramUpdateJournalStore,
+  getTelegramUpdateJournalAdmissionScopes,
   TelegramUpdateJournalError,
   type TelegramJournaledUpdate,
 } from "../lib/journal.ts";
+import {
+  createTelegramWorkspaceAdmissionLedger,
+  TelegramWorkspaceAdmissionError,
+  type TelegramWorkspaceAdmissionLedger,
+} from "../lib/workspace-admission.ts";
 
 const workerPath = fileURLToPath(
   new URL("./fixtures/journal-worker.ts", import.meta.url),
 );
+
+test("Follower journal discovery is profile-exact, segment-aware, and fail-closed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-journal-discovery-"));
+  try {
+    const defaultA = join(dir, "follower-inbox-aaaaaaaaaaaaaaaa.json");
+    const defaultB = join(dir, "follower-inbox-bbbbbbbbbbbbbbbb.json");
+    const namedC = join(dir, "follower-inbox-cccccccccccccccc.work.json");
+    await writeFile(defaultA, "{}\n");
+    await mkdir(`${defaultA}.segments`);
+    await mkdir(`${defaultB}.segments`);
+    await writeFile(namedC, "{}\n");
+    await mkdir(join(dir, "follower-inbox-dddddddddddddddd.json"));
+    await writeFile(join(dir, "follower-inbox-not-a-hash.json"), "{}\n");
+    assert.deepEqual(discoverTelegramFollowerJournalPaths({ directory: dir }), {
+      paths: [defaultA, defaultB], complete: false,
+    });
+    assert.deepEqual(discoverTelegramFollowerJournalPaths({ directory: dir, profileName: "work" }), {
+      paths: [namedC], complete: true,
+    });
+    assert.deepEqual(discoverTelegramFollowerJournalPaths({
+      directory: join(dir, "missing"), profileName: "work",
+    }), { paths: [], complete: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 function isJournalError(
   error: unknown,
@@ -112,6 +146,10 @@ function createStore(
     getQueueProcessLiveness?: (
       owner: { processId: number; processBirthId: string },
     ) => "alive" | "dead" | "unverifiable";
+    workspaceAdmission?: Pick<
+      TelegramWorkspaceAdmissionLedger,
+      "acquireAdmission" | "releaseAdmission"
+    >;
     onPublicationBoundary?: (
       boundary: "before-write" | "after-write-before-rename",
       publicationPath: string,
@@ -138,6 +176,7 @@ function createStore(
       processBirthId: queueOwnerIdentity.processBirthId,
     },
     getQueueProcessLiveness: options.getQueueProcessLiveness,
+    workspaceAdmission: options.workspaceAdmission,
     onPublicationBoundary: options.onPublicationBoundary,
     onRecovery: options.onRecovery,
   });
@@ -272,6 +311,13 @@ test("Update journal binding runtime selects leader, follower, and recipient aut
       }).queueOwner?.instanceId,
       "recipient-instance",
     );
+    const discovered = runtime.createPathResolver(
+      join(dir, "follower-inbox-0123456789abcdef.work.json"),
+    )()!;
+    assert.equal(
+      getTelegramUpdateJournalBindingPath(discovered.recoveryKey),
+      join(dir, "follower-inbox-0123456789abcdef.work.json"),
+    );
     assert.equal(
       runtime.getActiveRecoveryKey(),
       runtime.resolveFollower()!.recoveryKey,
@@ -365,6 +411,203 @@ test("Update journal receipt scope resolver freezes same-transport bot enrichmen
       }),
     }),
   );
+});
+
+test("Update journal derives conservative Workspace admission scopes", () => {
+  assert.deepEqual(
+    getTelegramUpdateJournalAdmissionScopes([
+      {
+        update_id: 1,
+        message: { chat: { id: 100 }, message_thread_id: 10 },
+      },
+      {
+        update_id: 2,
+        callback_query: {
+          message: { chat: { id: 200 }, message_thread_id: 20 },
+        },
+      },
+    ]),
+    [
+      { kind: "target", target: { chatId: 100, threadId: 10 } },
+      { kind: "target", target: { chatId: 200, threadId: 20 } },
+    ],
+  );
+  assert.deepEqual(
+    getTelegramUpdateJournalAdmissionScopes([
+      {
+        update_id: 3,
+        message: { chat: { id: 100 }, message_thread_id: 10 },
+      },
+      { update_id: 4, edited_message: { chat: { id: 100 } } },
+    ]),
+    [{ kind: "chat", chatId: 100 }],
+  );
+  assert.deepEqual(
+    getTelegramUpdateJournalAdmissionScopes([
+      { update_id: 5, callback_query: { inline_message_id: "opaque" } },
+    ]),
+    [{ kind: "profile" }],
+  );
+  assert.deepEqual(
+    getTelegramUpdateJournalAdmissionScopes([
+      {
+        update_id: 6,
+        message: { chat: { id: 100 }, message_thread_id: "invalid" },
+      },
+    ]),
+    [{ kind: "profile" }],
+  );
+  assert.deepEqual(getTelegramUpdateJournalAdmissionScopes([]), [
+    { kind: "profile" },
+  ]);
+});
+
+test("Update journal holds Workspace admission through publication and releases it", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const admissionPath = join(dir, "workspace-admission.json");
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: admissionPath,
+      profileKey: "profile:journal",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:journal-admission-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    let observedLease = false;
+    let observedBlockedFence = false;
+    const store = createStore(path, {
+      workspaceAdmission: admission,
+      onPublicationBoundary(boundary) {
+        if (boundary !== "after-write-before-rename") return;
+        const snapshot = admission.read();
+        observedLease = snapshot.leases.some(
+          (lease) =>
+            lease.operationKind === "journal.append" &&
+            lease.scope.kind === "target" &&
+            lease.scope.target.chatId === 100 &&
+            lease.scope.target.threadId === 10,
+        );
+        observedBlockedFence =
+          admission.acquireRetirementFence({
+            operationId: "journal-boundary-fence",
+            retirementIntentId: "journal-boundary-intent",
+            bindingKey: "journal-boundary-binding",
+            slot: "A",
+            target: { chatId: 100, threadId: 10 },
+            leaderEpoch: 1,
+            retirementRequestedAtMs: 1,
+          }).kind === "blocked";
+      },
+    });
+    store.appendBatch([
+      {
+        update_id: 1,
+        message: { chat: { id: 100 }, message_thread_id: 10 },
+      },
+    ]);
+    assert.equal(observedLease, true);
+    assert.equal(observedBlockedFence, true);
+    assert.deepEqual(admission.read().leases, []);
+  });
+});
+
+test("Update journal rejects fenced targets and releases admission after failure", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "workspace-admission.json"),
+      profileKey: "profile:journal",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:journal-admission-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    const fence = admission.acquireRetirementFence({
+      operationId: "active-retirement",
+      retirementIntentId: "active-intent",
+      bindingKey: "active-binding",
+      slot: "A",
+      target: { chatId: 200, threadId: 20 },
+      leaderEpoch: 1,
+      retirementRequestedAtMs: 1,
+    });
+    assert.equal(fence.kind, "acquired");
+    const blocked = createStore(path, { workspaceAdmission: admission });
+    assert.throws(
+      () =>
+        blocked.appendBatch([
+          {
+            update_id: 1,
+            message: { chat: { id: 100 }, message_thread_id: 10 },
+          },
+          {
+            update_id: 2,
+            message: { chat: { id: 200 }, message_thread_id: 20 },
+          },
+        ]),
+      (error) =>
+        error instanceof TelegramWorkspaceAdmissionError &&
+        error.code === "admission-blocked",
+    );
+    assert.equal(admission.read().leases.length, 0);
+    assert.equal(existsSync(path), false);
+
+    if (fence.kind === "acquired") {
+      assert.equal(admission.releaseUnissuedRetirementFence(fence.fence), true);
+    }
+    const constrained = createStore(path, {
+      workspaceAdmission: admission,
+      maxEntries: 1,
+    });
+    assert.throws(
+      () =>
+        constrained.appendBatch([
+          {
+            update_id: 1,
+            message: { chat: { id: 100 }, message_thread_id: 10 },
+          },
+          {
+            update_id: 2,
+            message: { chat: { id: 100 }, message_thread_id: 10 },
+          },
+        ]),
+      (error) => isJournalError(error, "capacity"),
+    );
+    assert.deepEqual(admission.read().leases, []);
+  });
+});
+
+test("Update journal cursor-only admission is profile-wide", async () => {
+  await withJournalTempDir(async ({ dir, path }) => {
+    const admission = createTelegramWorkspaceAdmissionLedger({
+      path: join(dir, "workspace-admission.json"),
+      profileKey: "profile:journal",
+      owner: {
+        processId: process.pid,
+        processBirthId: `${process.pid}:journal-admission-test`,
+      },
+      getProcessLiveness: () => "alive",
+    });
+    const fence = admission.acquireRetirementFence({
+      operationId: "other-target-retirement",
+      retirementIntentId: "other-target-intent",
+      bindingKey: "other-target-binding",
+      slot: "B",
+      target: { chatId: 999, threadId: 99 },
+      leaderEpoch: 1,
+      retirementRequestedAtMs: 1,
+    });
+    assert.equal(fence.kind, "acquired");
+    const store = createStore(path, { workspaceAdmission: admission });
+    assert.throws(
+      () => store.appendBatch([], 1),
+      (error) =>
+        error instanceof TelegramWorkspaceAdmissionError &&
+        error.code === "admission-blocked",
+    );
+    assert.equal(existsSync(path), false);
+  });
 });
 
 test("Update journal appends batches, deduplicates exact replay, and removes entries", async () => {

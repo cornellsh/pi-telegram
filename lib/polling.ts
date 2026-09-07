@@ -682,6 +682,8 @@ export interface TelegramThreadCapabilityStateRuntime {
   isBusRuntimeEnabled(): boolean;
   shouldForceFreshLeaderThread(): boolean;
   setForceFreshLeaderThread(forceFresh: boolean): void;
+  getRequestedThreadName(): string | undefined;
+  setRequestedThreadName(threadName: string | undefined): void;
 }
 
 export type TelegramThreadTargetObservationHandler<TContext> = (
@@ -715,6 +717,10 @@ export interface TelegramThreadAwarePollingPorts<TContext, TOwner> {
     ctx: TContext,
     owner: TOwner,
   ) => Promise<boolean | undefined>;
+  restoreFollowerWithOwner: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
   stopFollowerRegistration: () => void;
 }
 
@@ -738,6 +744,11 @@ export interface TelegramThreadAwarePollingDeps<
     ctx: TContext,
     owner: TOwner,
   ) => Promise<boolean | undefined>;
+  restoreFollowerWithLeader?: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
   stopFollowerRegistration: () => void;
 }
 
@@ -760,6 +771,11 @@ export interface TelegramThreadCapabilityOrchestrationDeps<
     ctx: TContext,
     owner: TOwner,
   ) => Promise<boolean | undefined>;
+  restoreFollowerWithLeader?: (
+    ctx: TContext,
+    owner: TOwner,
+  ) => Promise<boolean | undefined>;
+  hasRememberedWorkspaceBinding?: (ctx: TContext) => boolean;
   stopFollowerRegistration: () => void;
   isTopicModeUnavailableError: (error: unknown) => boolean;
   updateStatus: (ctx: TContext) => void;
@@ -780,6 +796,7 @@ export function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapa
   let busPollingStarted = false;
   let topicModeUnavailable = false;
   let forceFreshLeaderThread = false;
+  let requestedThreadName: string | undefined;
   return {
     isBusPollingStarted: () => busPollingStarted,
     setBusPollingStarted(started) {
@@ -793,6 +810,10 @@ export function createTelegramThreadCapabilityStateRuntime(): TelegramThreadCapa
     shouldForceFreshLeaderThread: () => forceFreshLeaderThread,
     setForceFreshLeaderThread(forceFresh) {
       forceFreshLeaderThread = forceFresh;
+    },
+    getRequestedThreadName: () => requestedThreadName,
+    setRequestedThreadName(threadName) {
+      requestedThreadName = threadName;
     },
   };
 }
@@ -850,6 +871,8 @@ export function createTelegramThreadCapabilityOrchestration<TContext, TOwner>(
       startLeaderHealth: deps.startLeaderHealth,
       stopLeaderHealth: deps.stopLeaderHealth,
       registerFollowerWithLeader: deps.registerFollowerWithLeader,
+      restoreFollowerWithLeader: deps.restoreFollowerWithLeader,
+      hasRememberedWorkspaceBinding: deps.hasRememberedWorkspaceBinding,
       stopFollowerRegistration: deps.stopFollowerRegistration,
       recordEvent: deps.recordEvent,
       setTopicModeUnavailable: deps.state.setTopicModeUnavailable,
@@ -1110,24 +1133,34 @@ export function createTelegramThreadAwarePollingPorts<TContext, TOwner>(
     }
     await deps.stopClassicPolling();
   };
-  const registerFollowerWithOwner = async (
-    ctx: TContext,
-    owner: TOwner,
-  ): Promise<boolean | undefined> => {
+  const refreshFollowerState = async (): Promise<boolean> => {
     if (deps.topicTargetStore.refresh) {
       await deps.topicTargetStore.refresh();
     } else {
       await deps.topicTargetStore.load();
     }
-    if (deps.topicTargetStore.getBotState().threadMode !== "enabled") {
-      return undefined;
-    }
+    return deps.topicTargetStore.getBotState().threadMode === "enabled";
+  };
+  const registerFollowerWithOwner = async (
+    ctx: TContext,
+    owner: TOwner,
+  ): Promise<boolean | undefined> => {
+    if (!(await refreshFollowerState())) return undefined;
     return deps.registerFollowerWithLeader(ctx, owner);
+  };
+  const restoreFollowerWithOwner = async (
+    ctx: TContext,
+    owner: TOwner,
+  ): Promise<boolean | undefined> => {
+    if (!(await refreshFollowerState())) return undefined;
+    if (!deps.hasRememberedWorkspaceBinding?.(ctx)) return undefined;
+    return deps.restoreFollowerWithLeader?.(ctx, owner);
   };
   return {
     startPolling,
     stopPolling,
     registerFollowerWithOwner,
+    restoreFollowerWithOwner,
     stopFollowerRegistration: deps.stopFollowerRegistration,
   };
 }

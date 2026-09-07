@@ -49,6 +49,7 @@ import {
   type TelegramQueueHandoffPayload,
 } from "./queue.ts";
 import type { TelegramTarget } from "./target.ts";
+import type { TelegramThreadDisplayMode } from "./config.ts";
 import { isProcessAlive } from "./locks.ts";
 import { resolveAgentDir } from "./paths.ts";
 
@@ -152,6 +153,22 @@ export function getTelegramProcessLiveness(
   return proof.identity === owner.processBirthId ? "alive" : "dead";
 }
 
+export function getTelegramProcessBirthIdentityLiveness(
+  processBirthId: string,
+  options: TelegramProcessLivenessOptions = {},
+): TelegramProcessLiveness {
+  const match = /^(\d+):(start|generation):(.+)$/u.exec(processBirthId);
+  if (!match) return "unverifiable";
+  const processId = Number(match[1]);
+  if (!Number.isSafeInteger(processId) || processId <= 0) return "unverifiable";
+  const processAlive = options.isProcessAlive ?? isProcessAlive;
+  if (!processAlive(processId)) return "dead";
+  if (match[2] === "generation") return "unverifiable";
+  const proof = getTelegramProcessBirthProof(processId, options);
+  if (proof.status === "unverifiable") return "unverifiable";
+  return proof.identity === processBirthId ? "alive" : "dead";
+}
+
 export function createCurrentTelegramBusProcessRuntime(input: {
   getActiveProfileName: () => string | undefined;
   pid?: number;
@@ -208,6 +225,11 @@ export const TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION =
   "durable-follower-admission-v1" as const;
 export const TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF =
   "queue-handoff-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_THREAD_RENAME =
+  "workspace-thread-rename-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_THREAD_DISPLAY_MODE = "thread-display-mode-v1" as const;
+export const TELEGRAM_BUS_CAPABILITY_WORKSPACE_FOLLOWER_AUTO_CONNECT =
+  "workspace-follower-auto-connect-v1" as const;
 
 export interface TelegramBusProtocolIdentity {
   protocolVersion: number;
@@ -688,6 +710,11 @@ export type TelegramBusEnvelope = (
       registration: TelegramBusInstanceRegistration;
     }
   | {
+      kind: "follower.restoreWorkspace";
+      requestId: string;
+      registration: TelegramBusInstanceRegistration;
+    }
+  | {
       kind: "follower.heartbeat";
       requestId: string;
       instanceId: string;
@@ -699,6 +726,21 @@ export type TelegramBusEnvelope = (
       requestId: string;
       instanceId: string;
       registrationGeneration?: string;
+      sentAtMs: number;
+    }
+  | {
+      kind: "follower.setThreadDisplayMode";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration: string;
+      mode: TelegramThreadDisplayMode;
+    }
+  | {
+      kind: "follower.renameThread";
+      requestId: string;
+      instanceId: string;
+      registrationGeneration: string;
+      threadName: string;
       sentAtMs: number;
     }
   | {
@@ -817,7 +859,8 @@ export type TelegramBusEnvelope = (
           | "request-id-collision"
           | "ledger-overloaded"
           | "incompatible-protocol"
-          | "stale-target";
+          | "stale-target"
+          | "workspace-binding-unavailable";
         method?: string;
         chatId?: number;
         threadId?: number;
@@ -833,7 +876,10 @@ export type TelegramBusEnvelopeTrafficClass =
 export function getTelegramBusEnvelopeTrafficClass(
   envelope: TelegramBusEnvelope,
 ): TelegramBusEnvelopeTrafficClass {
-  if (envelope.kind === "follower.register") return "bootstrap";
+  if (
+    envelope.kind === "follower.register" ||
+    envelope.kind === "follower.restoreWorkspace"
+  ) return "bootstrap";
   if (envelope.kind === "bus.ack") return "response";
   return "generation-fenced";
 }
@@ -879,13 +925,25 @@ export function parseTelegramBusEnvelope(
   let envelope: TelegramBusEnvelope | undefined;
   switch (kind) {
     case "follower.register":
-      envelope = parseRegisterEnvelope(value, requestId);
+    case "follower.restoreWorkspace":
+      envelope = parseRegisterEnvelope(value, requestId, kind);
       break;
     case "follower.heartbeat":
       envelope = parseHeartbeatEnvelope(value, requestId);
       break;
     case "follower.disconnect":
       envelope = parseDisconnectEnvelope(value, requestId);
+      break;
+    case "follower.setThreadDisplayMode":
+      if (typeof value.instanceId === "string" &&
+          typeof value.registrationGeneration === "string" &&
+          (value.mode === "letters" || value.mode === "names" || value.mode === "directories")) {
+        envelope = { kind, requestId, instanceId: value.instanceId,
+          registrationGeneration: value.registrationGeneration, mode: value.mode };
+      }
+      break;
+    case "follower.renameThread":
+      envelope = parseRenameThreadEnvelope(value, requestId);
       break;
     case "leader.forwardCallback":
       envelope = parseForwardCallbackEnvelope(value, requestId);
@@ -1512,7 +1570,8 @@ export function createTelegramBusLocalServer(
   );
   const getRequestLedgerKey = (envelope: TelegramBusEnvelope): string => {
     const identity =
-      envelope.kind === "follower.register"
+      envelope.kind === "follower.register" ||
+      envelope.kind === "follower.restoreWorkspace"
         ? envelope.registration.instanceId
         : "instanceId" in envelope
           ? envelope.instanceId
@@ -1823,21 +1882,29 @@ function sendTelegramBusLocalEnvelopeOnce(
     const socket = createConnection(options.socketPath);
     let settled = false;
     let buffer = "";
+    let timeoutFinalizer: ReturnType<typeof setImmediate> | undefined;
     const settle = (callback: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (timeoutFinalizer) clearImmediate(timeoutFinalizer);
       socket.destroy();
       callback();
     };
     const timeout = setTimeout(() => {
-      settle(() =>
-        reject(
-          createTelegramBusTransportTimeoutError(
-            "Timed out waiting for Telegram bus response",
+      // A long synchronous Pi/TUI turn can resume in the timers phase after
+      // the peer acknowledgement is already buffered. Give pending socket I/O
+      // one poll phase before converting elapsed wall time into a transport
+      // failure; an actually silent peer still times out in this same turn.
+      timeoutFinalizer = setImmediate(() => {
+        settle(() =>
+          reject(
+            createTelegramBusTransportTimeoutError(
+              "Timed out waiting for Telegram bus response",
+            ),
           ),
-        ),
-      );
+        );
+      });
     }, timeoutMs);
     socket.setEncoding("utf8");
     socket.once("connect", () => {
@@ -2047,11 +2114,10 @@ async function handleTelegramBusSocketLine(
 function parseRegisterEnvelope(
   value: Record<string, unknown>,
   requestId: string,
+  kind: "follower.register" | "follower.restoreWorkspace",
 ): TelegramBusEnvelope | undefined {
   const registration = parseRegistration(value.registration);
-  return registration
-    ? { kind: "follower.register", requestId, registration }
-    : undefined;
+  return registration ? { kind, requestId, registration } : undefined;
 }
 
 function parseHeartbeatEnvelope(
@@ -2085,6 +2151,25 @@ function parseDisconnectEnvelope(
         ...(typeof value.registrationGeneration === "string"
           ? { registrationGeneration: value.registrationGeneration }
           : {}),
+        sentAtMs: value.sentAtMs,
+      }
+    : undefined;
+}
+
+function parseRenameThreadEnvelope(
+  value: Record<string, unknown>,
+  requestId: string,
+): TelegramBusEnvelope | undefined {
+  return typeof value.instanceId === "string" &&
+    typeof value.registrationGeneration === "string" &&
+    typeof value.threadName === "string" &&
+    typeof value.sentAtMs === "number"
+    ? {
+        kind: "follower.renameThread",
+        requestId,
+        instanceId: value.instanceId,
+        registrationGeneration: value.registrationGeneration,
+        threadName: value.threadName,
         sentAtMs: value.sentAtMs,
       }
     : undefined;
@@ -2578,7 +2663,8 @@ function parseAckEnvelope(
       code === "request-id-collision" ||
       code === "ledger-overloaded" ||
       code === "incompatible-protocol" ||
-      code === "stale-target"
+      code === "stale-target" ||
+      code === "workspace-binding-unavailable"
     ) {
       const chatId = value.error.chatId;
       const threadId = value.error.threadId;

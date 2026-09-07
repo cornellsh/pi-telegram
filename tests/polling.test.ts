@@ -496,14 +496,17 @@ test("Thread capability state runtime owns transition flags", () => {
   assert.equal(state.isBusPollingStarted(), false);
   assert.equal(state.isTopicModeUnavailable(), false);
   assert.equal(state.shouldForceFreshLeaderThread(), false);
+  assert.equal(state.getRequestedThreadName(), undefined);
 
   state.setBusPollingStarted(true);
   state.setTopicModeUnavailable(true);
   state.setForceFreshLeaderThread(true);
+  state.setRequestedThreadName("Navigator");
 
   assert.equal(state.isBusPollingStarted(), true);
   assert.equal(state.isTopicModeUnavailable(), true);
   assert.equal(state.shouldForceFreshLeaderThread(), true);
+  assert.equal(state.getRequestedThreadName(), "Navigator");
 });
 
 function createCapabilityLifecycleFixture(hooks: {
@@ -722,6 +725,59 @@ test("Thread-aware polling refreshes owner-published enabled mode over stale loc
     true,
   );
   assert.equal(followerRegistrations, 1);
+});
+
+test("Thread-aware polling auto-restores followers only for remembered Workspaces", async () => {
+  let remembered = false;
+  let restores = 0;
+  const store = {
+    async load() {},
+    async refresh() {},
+    async persist() {},
+    getBotState() {
+      return { threadMode: "enabled" as const };
+    },
+    setBotState() {},
+    list() {
+      return [];
+    },
+  };
+  const ports = createTelegramThreadAwarePollingPorts({
+    getAllowedUserId: () => 42,
+    callApi: async <TResponse,>(): Promise<TResponse> => ({}) as TResponse,
+    topicTargetStore: store,
+    isBusRuntimeEnabled: () => false,
+    isTopicModeUnavailableError: () => false,
+    getPollingStartedWithTelegramBus: () => false,
+    setPollingStartedWithTelegramBus() {},
+    setForceFreshLeaderThreadOnNextStart() {},
+    setTopicModeUnavailable() {},
+    startClassicPolling() {},
+    async stopClassicPolling() {},
+    async startBusLeaderPolling() {},
+    async stopBusLeaderPolling() {},
+    startLeaderHealth() {},
+    stopLeaderHealth() {},
+    registerFollowerWithLeader: async () => true,
+    hasRememberedWorkspaceBinding: () => remembered,
+    restoreFollowerWithLeader: async () => {
+      restores += 1;
+      return true;
+    },
+    stopFollowerRegistration() {},
+    recordEvent() {},
+  });
+
+  assert.equal(
+    await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }),
+    undefined,
+  );
+  remembered = true;
+  assert.equal(
+    await ports.restoreFollowerWithOwner(TEST_CONTEXT, { pid: 1 }),
+    true,
+  );
+  assert.equal(restores, 1);
 });
 
 test("Thread capability downgrade retries classic restore after failure", async () => {

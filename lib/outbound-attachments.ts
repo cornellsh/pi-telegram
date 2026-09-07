@@ -187,7 +187,6 @@ export function planTelegramRichOutboundAttachment(options: {
         },
       },
     ],
-    skip_entity_detection: true,
   };
   return {
     method: "sendRichMessage",

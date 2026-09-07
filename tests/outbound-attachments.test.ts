@@ -142,7 +142,6 @@ test("Rich outbound attachment planner builds one target-scoped media result", (
               },
             },
           ],
-          skip_entity_detection: true,
         }),
         reply_markup: JSON.stringify(replyMarkup),
       },

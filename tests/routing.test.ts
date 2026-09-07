@@ -22,6 +22,11 @@ import * as TextGroups from "../lib/text-groups.ts";
 import * as Threads from "../lib/threads.ts";
 import * as Updates from "../lib/updates.ts";
 import { createDefaultTelegramBridgeApiRuntime } from "../lib/telegram-api.ts";
+import {
+  createTelegramWorkspaceAdmissionLedger,
+  TelegramWorkspaceAdmissionError,
+} from "../lib/workspace-admission.ts";
+import { createTelegramWorkspaceOperationRuntime } from "../lib/workspace-retirement.ts";
 
 interface TestContext {
   cwd: string;
@@ -405,6 +410,12 @@ interface RouteHarnessOptions {
     TestMessage, TestCallbackQuery, TestContext, TestModel
   >["sendInteractiveMessage"];
   threadStore?: Threads.TelegramTopicTargetStore;
+  runWorkspaceOperation?: Routing.TelegramInboundRouteRuntimeDeps<
+    TestMessage,
+    TestCallbackQuery,
+    TestContext,
+    TestModel
+  >["runWorkspaceOperation"];
   callApi?: Routing.TelegramInboundRouteRuntimeDeps<
     TestMessage,
     TestCallbackQuery,
@@ -443,6 +454,7 @@ interface RouteHarnessOptions {
     TestModel
   >["setCurrentLeaderIdentity"];
   getLiveThreadTargets?: () => Queue.TelegramQueueTarget[];
+  getDisplayTitle?: (target: Queue.TelegramQueueTarget) => string | undefined;
   getLocalThreadLabelForTarget?: (
     target: Queue.TelegramQueueTarget,
   ) => string | undefined;
@@ -470,6 +482,17 @@ interface RouteHarnessOptions {
     TestContext,
     TestModel
   >["invokeBoundButtonAction"];
+  observeTextReply?: (
+    text: string,
+    options: Parameters<
+      Routing.TelegramInboundRouteRuntimeDeps<
+        TestMessage,
+        TestCallbackQuery,
+        TestContext,
+        TestModel
+      >["sendTextReply"]
+    >[3],
+  ) => void;
 }
 
 function createRouteHarness(options: RouteHarnessOptions = {}) {
@@ -539,6 +562,7 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
     getCurrentInstanceId: () => options.instanceId ?? "leader-a",
     getAdmissionScope: () => "profile-a:bot-a",
     getLiveThreadTargets: options.getLiveThreadTargets,
+    getDisplayTitle: options.getDisplayTitle,
     getLocalThreadLabelForTarget: options.getLocalThreadLabelForTarget,
     getCurrentLeaderEpoch: options.getCurrentLeaderEpoch,
     setCurrentLeaderIdentity: options.setCurrentLeaderIdentity,
@@ -570,6 +594,7 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
         })),
     },
     threadStore: options.threadStore,
+    runWorkspaceOperation: options.runWorkspaceOperation,
     buttonActionStore,
     invokeBoundButtonAction: options.invokeBoundButtonAction,
     updateStatus: () => events.push("status"),
@@ -585,10 +610,13 @@ function createRouteHarness(options: RouteHarnessOptions = {}) {
       events.push(`interactive-options:${JSON.stringify(sendOptions ?? {})}`);
       return 99;
     }),
-    sendTextReply: async (_chatId, _replyToMessageId, text, options) => {
+    sendTextReply: async (_chatId, _replyToMessageId, text, replyOptions) => {
+      options.observeTextReply?.(text, replyOptions);
       events.push(`reply:${text}`);
-      if (typeof options?.target?.threadId === "number") {
-        events.push(`reply-target:${options.target.chatId}:${options.target.threadId}`);
+      if (typeof replyOptions?.target?.threadId === "number") {
+        events.push(
+          `reply-target:${replyOptions.target.chatId}:${replyOptions.target.threadId}`,
+        );
       }
       return undefined;
     },
@@ -1021,6 +1049,90 @@ test("Routing runtime binds the first unbound thread to the leader without visib
   });
 });
 
+test("Routing runtime fails closed when retained Workspaces occupy every global slot", async () => {
+  await withTopicStore(async (threadStore) => {
+    for (const [index, slot] of Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ").entries()) {
+      const identity = Threads.createTelegramWorkspaceBindingIdentity(`/retained/${index}`);
+      assert.ok(identity);
+      threadStore.upsertWorkspaceBinding({
+        ...identity,
+        target: { chatId: 100, threadId: 100 + index },
+        slot,
+        updatedAtMs: index + 1,
+      });
+    }
+    await threadStore.persist();
+    const apiCalls: unknown[] = [];
+    const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
+      threadStore,
+      callApi: async (method, body) => {
+        apiCalls.push({ method, body });
+        return {} as never;
+      },
+    });
+
+    await routeRuntime.handleUpdate(unboundTopicUpdate("blocked"), {
+      cwd: "/repo",
+    });
+
+    assert.deepEqual(threadStore.list(), []);
+    assert.equal(threadStore.listWorkspaceBindings().length, 26);
+    assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
+    assert.deepEqual(apiCalls, []);
+    assert.equal(events.includes(
+      "reply:No Telegram instance slot is available. Automatic reclamation is disabled for safety.",
+    ), true);
+  });
+});
+
+test("Routing runtime invalidates a proven-stale slotless leader at full capacity", async () => {
+  await withTopicStore(async (threadStore) => {
+    threadStore.upsert({
+      profileKey: "cwd:/repo",
+      owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
+      target: { chatId: 100, threadId: 7 },
+      status: "active",
+      createdAtMs: 1,
+      updatedAtMs: 2,
+      instanceId: "leader-a",
+    });
+    for (const [index, slot] of Array.from("ABCDEFGHIJKLMNOPQRSTUVWXYZ").entries()) {
+      const identity = Threads.createTelegramWorkspaceBindingIdentity(`/retained/${index}`);
+      assert.ok(identity);
+      threadStore.upsertWorkspaceBinding({
+        ...identity,
+        target: { chatId: 100, threadId: 100 + index },
+        slot,
+        updatedAtMs: index + 1,
+      });
+    }
+    await threadStore.persist();
+    const apiCalls: string[] = [];
+    const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
+      threadStore,
+      callApi: async (method) => {
+        apiCalls.push(method);
+        throw new Error(
+          "Telegram API sendChatAction failed: HTTP 400: Bad Request: message thread not found",
+        );
+      },
+    });
+
+    await routeRuntime.handleUpdate(unboundTopicUpdate("blocked"), { cwd: "/repo" });
+
+    assert.equal(threadStore.getByProfileKey("cwd:/repo"), undefined);
+    assert.equal(threadStore.listSyncObservations().some((observation) =>
+      observation.target.chatId === 100 && observation.target.threadId === 7 &&
+      observation.syncStatus === "deleted",
+    ), true);
+    assert.deepEqual(apiCalls, ["sendChatAction"]);
+    assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
+    assert.equal(events.includes(
+      "reply:No Telegram instance slot is available. Automatic reclamation is disabled for safety.",
+    ), true);
+  });
+});
+
 test("Routing runtime assigns internal baked name without visibly renaming unnamed leader startup topic", async () => {
   await withTopicStore(async (threadStore) => {
     const apiCalls: unknown[] = [];
@@ -1222,6 +1334,7 @@ test("Routing runtime falls back to baked name for non-identity topic thread nam
 test("Routing runtime preserves active follower topics when the follower is not connected", async () => {
   await withTopicStore(async (threadStore) => {
     const apiCalls: unknown[] = [];
+    const replyModes: Array<"HTML" | undefined> = [];
     threadStore.upsert({
       profileKey: "cwd:/repo",
       target: { chatId: 100, threadId: 7 },
@@ -1248,6 +1361,9 @@ test("Routing runtime preserves active follower topics when the follower is not 
         apiCalls.push({ method, body });
         return {} as never;
       },
+      observeTextReply: (_text, options) => {
+        replyModes.push(options?.parseMode);
+      },
     });
 
     await routeRuntime.handleUpdate(unboundTopicUpdate("for follower"), {
@@ -1262,10 +1378,11 @@ test("Routing runtime preserves active follower topics when the follower is not 
     assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
     assert.equal(
       events.includes(
-        "reply:Instance Beacon is not connected to the Telegram bus yet. Run /telegram-connect in that Pi instance; keeping this thread.",
+        "reply:Instance Beacon is not currently registered with the Telegram bus. This thread is preserved; retry shortly. If it does not recover, run <code>/telegram-connect</code> in that Pi instance.",
       ),
       true,
     );
+    assert.deepEqual(replyModes, ["HTML"]);
   });
 });
 
@@ -2636,6 +2753,50 @@ test("Routing runtime filters All chooser buttons to live routable thread target
   });
 });
 
+test("Thread choosers use acknowledged labels without granting liveness or changing captured numeric targets", async () => {
+  await withTopicStore(async (threadStore) => {
+    for (const [threadId, threadName, instanceId] of [[7, "Anchor", "leader-a"], [8, "Briar", "offline"]] as const) {
+      threadStore.upsert({ profileKey: `instance:${instanceId}`, instanceId,
+        target: { chatId: 100, threadId }, threadName, slot: threadId === 7 ? "A" : "B",
+        status: "active", createdAtMs: 1, updatedAtMs: 1 });
+    }
+    await threadStore.persist();
+    let title = "repo_a";
+    const { events, routeRuntime } = createRouteHarness({
+      threadStore, getLiveThreadTargets: () => [{ chatId: 100, threadId: 7 }],
+      getDisplayTitle: ({ threadId }) => threadId === 7 ? title : "offline_b",
+    });
+    await routeRuntime.handleUpdate({ message: {
+      message_id: 12, chat: { id: 100, type: "private" },
+      from: { id: 7, is_bot: false }, text: "/status",
+    } }, { cwd: "/repo" });
+    await routeRuntime.handleUpdate(unboundTopicUpdate(), { cwd: "/repo" });
+    const markups = events.filter((event) => event.startsWith("markup:"));
+    assert.equal(markups.length, 2);
+    for (const markup of markups) {
+      assert.match(markup, /"text":"↪️ repo_a"/);
+      assert.doesNotMatch(markup, /Anchor|Briar|offline_b/);
+    }
+    title = "A";
+    await routeRuntime.handleUpdate({ callback_query: {
+      id: "display-restore", from: { id: 7, is_bot: false },
+      message: { message_id: 99, message_thread_id: 42, chat: { id: 100, type: "private" } },
+      data: "rerouterestore:2",
+    } }, { cwd: "/repo" });
+    const restore = events.filter((event) => event.startsWith("markup:")).at(-1);
+    assert.match(restore ?? "", /"text":"➡️ A"/);
+    assert.match(restore ?? "", /reroutenew:2:7/);
+    await routeRuntime.handleUpdate({ callback_query: {
+      id: "display-route", from: { id: 7, is_bot: false },
+      message: { message_id: 99, chat: { id: 100, type: "private" } },
+      data: "reroute:1:7",
+    } }, { cwd: "/repo" });
+    assert.equal(events.includes("status-menu"), true);
+    assert.equal(threadStore.getByProfileKey("instance:leader-a")?.threadName, "Anchor");
+    assert.deepEqual(threadStore.getByProfileKey("instance:leader-a")?.target, { chatId: 100, threadId: 7 });
+  });
+});
+
 test("Routing runtime treats extension and prompt-template commands as All chooser commands", async () => {
   await withTopicStore(async (threadStore) => {
     threadStore.upsert({
@@ -3540,6 +3701,237 @@ test("Routing runtime assigns a new slot when user explicitly chooses source thr
         body: { chat_id: 100, message_thread_id: 7 },
       },
     ]);
+  });
+});
+
+test("Retained Workspace fence blocks reroute replacement before store or API mutation", async () => {
+  for (const phase of ["fenced", "deletion-issued"] as const) {
+    await withTopicStore(async (threadStore) => {
+      const admissionDir = await mkdtemp(join(tmpdir(), "pi-telegram-routing-admission-"));
+      try {
+        const admission = createTelegramWorkspaceAdmissionLedger({
+          path: join(admissionDir, "workspace-admission.json"),
+          profileKey: "profile:routing",
+          owner: {
+            processId: process.pid,
+            processBirthId: `${process.pid}:routing-admission-test`,
+          },
+          getProcessLiveness: () => "alive",
+        });
+        const operationRuntime = createTelegramWorkspaceOperationRuntime({
+          getWorkspaceAdmission: () => admission,
+        });
+        threadStore.upsert({
+          profileKey: "cwd:/repo",
+          owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
+          target: { chatId: 100, threadId: 7 },
+          status: "active",
+          createdAtMs: 1000,
+          updatedAtMs: 1000,
+          instanceId: "leader-a",
+          slot: "A",
+          threadName: "Coral",
+          rerouteConfirmedAtMs: 1500,
+        });
+        await threadStore.persist();
+        const apiCalls: unknown[] = [];
+        const leaderIdentities: unknown[] = [];
+        const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
+          threadStore,
+          runWorkspaceOperation: operationRuntime.run,
+          setCurrentLeaderIdentity: (identity) => {
+            leaderIdentities.push(identity);
+          },
+          callApi: async (method, body) => {
+            apiCalls.push({ method, body });
+            return {} as never;
+          },
+        });
+        await routeRuntime.handleUpdate(unboundTopicUpdate(), { cwd: "/repo" });
+        await routeRuntime.handleUpdate(
+          {
+            callback_query: {
+              id: `restore-menu-${phase}`,
+              from: { id: 7, is_bot: false },
+              message: {
+                message_id: 99,
+                message_thread_id: 42,
+                chat: { id: 100, type: "private" },
+              },
+              data: "rerouterestore:1",
+            },
+          },
+          { cwd: "/repo" },
+        );
+        assert.match(
+          events.filter((event) => event.startsWith("markup:")).at(-1) ?? "",
+          /"callback_data":"reroutenew:1:7"/u,
+        );
+        const acquired = admission.acquireRetirementFence({
+          operationId: `routing-fence:${phase}`,
+          retirementIntentId: `routing-intent:${phase}`,
+          bindingKey: "routing-binding",
+          slot: "A",
+          target: { chatId: 100, threadId: 7 },
+          leaderEpoch: 1,
+          retirementRequestedAtMs: 1,
+        });
+        assert.equal(acquired.kind, "acquired");
+        if (acquired.kind !== "acquired") return;
+        if (phase === "deletion-issued") {
+          assert.equal(admission.issueDeletionPermit(acquired.fence).kind, "issued");
+        }
+        const callsBeforeBlockedRestore = apiCalls.length;
+
+        await assert.rejects(
+          () => routeRuntime.handleUpdate(
+            {
+              callback_query: {
+                id: `reroute-${phase}`,
+                from: { id: 7, is_bot: false },
+                message: {
+                  message_id: 99,
+                  message_thread_id: 42,
+                  chat: { id: 100, type: "private" },
+                },
+                data: "reroutenew:1:7",
+              },
+            },
+            { cwd: "/repo" },
+          ),
+          (error) => error instanceof TelegramWorkspaceAdmissionError &&
+            error.code === "admission-blocked",
+        );
+        assert.deepEqual(
+          threadStore.getByProfileKey("cwd:/repo")?.target,
+          { chatId: 100, threadId: 7 },
+        );
+        assert.equal(threadStore.getByProfileKey("cwd:/repo")?.slot, "A");
+        assert.equal(apiCalls.length, callsBeforeBlockedRestore);
+        assert.deepEqual(leaderIdentities, []);
+        assert.equal(telegramQueueStore.getQueuedItems().length, 0);
+      } finally {
+        await rm(admissionDir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("Retained Workspace fence blocks unbound target adoption before store mutation", async () => {
+  for (const phase of ["fenced", "deletion-issued"] as const) {
+    await withTopicStore(async (threadStore) => {
+      const admissionDir = await mkdtemp(join(tmpdir(), "pi-telegram-unbound-admission-"));
+      try {
+        const admission = createTelegramWorkspaceAdmissionLedger({
+          path: join(admissionDir, "workspace-admission.json"),
+          profileKey: "profile:unbound-routing",
+          owner: {
+            processId: process.pid,
+            processBirthId: `${process.pid}:unbound-routing-test`,
+          },
+          getProcessLiveness: () => "alive",
+        });
+        const acquired = admission.acquireRetirementFence({
+          operationId: `unbound-fence:${phase}`,
+          retirementIntentId: `unbound-intent:${phase}`,
+          bindingKey: "unbound-binding",
+          slot: "A",
+          target: { chatId: 100, threadId: 7 },
+          leaderEpoch: 1,
+          retirementRequestedAtMs: 1,
+        });
+        assert.equal(acquired.kind, "acquired");
+        if (acquired.kind !== "acquired") return;
+        if (phase === "deletion-issued") {
+          assert.equal(admission.issueDeletionPermit(acquired.fence).kind, "issued");
+        }
+        const operationRuntime = createTelegramWorkspaceOperationRuntime({
+          getWorkspaceAdmission: () => admission,
+        });
+        let apiCalls = 0;
+        const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
+          threadStore,
+          runWorkspaceOperation: operationRuntime.run,
+          callApi: async <TResponse>() => {
+            apiCalls += 1;
+            return { ok: true } as TResponse;
+          },
+        });
+
+        await assert.rejects(
+          () => routeRuntime.handleUpdate(unboundTopicUpdate(), { cwd: "/repo" }),
+          (error) => error instanceof TelegramWorkspaceAdmissionError &&
+            error.code === "admission-blocked",
+        );
+        assert.deepEqual(threadStore.list(), []);
+        assert.deepEqual(threadStore.listReservations(), []);
+        assert.equal(apiCalls, 0);
+        assert.equal(telegramQueueStore.getQueuedItems().length, 0);
+        assert.deepEqual(events, []);
+      } finally {
+        await rm(admissionDir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("New-slot reroute preserves its leader when all other slots are retained", async () => {
+  await withTopicStore(async (threadStore) => {
+    threadStore.upsert({
+      profileKey: "cwd:/repo",
+      owner: { kind: "leader", cwd: "/repo", instanceId: "leader-a" },
+      target: { chatId: 100, threadId: 7 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "leader-a",
+      slot: "A",
+      threadName: "Coral",
+      rerouteConfirmedAtMs: 1500,
+    });
+    for (const [index, slot] of Array.from("BCDEFGHIJKLMNOPQRSTUVWXYZ").entries()) {
+      const identity = Threads.createTelegramWorkspaceBindingIdentity(`/retained/${index}`);
+      assert.ok(identity);
+      threadStore.upsertWorkspaceBinding({
+        ...identity,
+        target: { chatId: 100, threadId: 100 + index },
+        slot,
+        updatedAtMs: index + 1,
+      });
+    }
+    await threadStore.persist();
+    const apiCalls: string[] = [];
+    const { events, routeRuntime, telegramQueueStore } = createRouteHarness({
+      threadStore,
+      callApi: async (method) => {
+        apiCalls.push(method);
+        return {} as never;
+      },
+    });
+    await routeRuntime.handleUpdate(unboundTopicUpdate(), { cwd: "/repo" });
+    for (const [id, data] of [
+      ["restore-menu-cb", "rerouterestore:1"],
+      ["reroute-cb", "reroutenew:1:7"],
+    ] as const) {
+      await routeRuntime.handleUpdate({ callback_query: {
+        id,
+        from: { id: 7, is_bot: false },
+        message: { message_id: 99, message_thread_id: 42,
+          chat: { id: 100, type: "private" } },
+        data,
+      } }, { cwd: "/repo" });
+    }
+
+    const record = threadStore.getByProfileKey("cwd:/repo");
+    assert.deepEqual(record?.target, { chatId: 100, threadId: 7 });
+    assert.equal(record?.slot, "A");
+    assert.equal(record?.status, "active");
+    assert.equal(events.includes(
+      "answer:No Telegram instance slot is available. Automatic reclamation is disabled for safety.",
+    ), true);
+    assert.equal(apiCalls.includes("editForumTopic"), false);
+    assert.equal(apiCalls.includes("deleteForumTopic"), false);
+    assert.deepEqual(telegramQueueStore.getQueuedItems(), []);
   });
 });
 
