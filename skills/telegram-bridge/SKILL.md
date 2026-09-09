@@ -107,6 +107,16 @@ One `telegram_voice` comment creates one voice artifact; voice does not use matr
 
 Keep speech TTS-friendly: omit Markdown, tables, and raw code. Voice delivery creates OGG/Opus itself; do not attach duplicate audio. Explicit voice remains available regardless of automatic `hidden`, `mirror`, or `always` policy.
 
+Author voice text for the ear, not the eye. The spoken text is yours to write; it
+need not match the displayed reply:
+
+- Restore proper spelling and diacritics even when the user typed without them.
+- Set `lang` to the dominant language of the spoken text (for example `cs` for Czech) so a native voice reads it; leave `lang` unset for heavily mixed text.
+- Expand abbreviations, numbers, URLs, and file paths into speakable words. Say "pi dot dev" rather than a raw URL.
+- No emoji, no bullet syntax, no heading marks; use short spoken sentences with commas and periods for rhythm.
+- Keep one note under roughly forty-five seconds of speech; split longer content into more than one `telegram_voice` comment.
+- If synthesis fails, the bridge falls back to a text reply on its own; never send the same content twice.
+
 ## Files And Safety
 
 Use `telegram_attach` for requested/generated files instead of merely naming paths. Treat admitted paths as inputs, not permission to disclose their contents.
