@@ -113,7 +113,9 @@ need not match the displayed reply:
 - Restore proper spelling and diacritics even when the user typed without them.
 - Set `lang` to the dominant language of the spoken text (for example `cs` for Czech) so a native voice reads it; leave `lang` unset for heavily mixed text.
 - Expand abbreviations, numbers, URLs, and file paths into speakable words. Say "pi dot dev" rather than a raw URL.
-- No emoji, no bullet syntax, no heading marks; use short spoken sentences with commas and periods for rhythm.
+- No emoji, no bullet syntax, no heading marks.
+- Write speech as one flowing stream, the way people actually leave voice notes. Every period becomes a long synthetic pause, so prefer commas and connectors over full stops, and never use staccato runs of short sentences. One or two periods per note is plenty.
+- Use natural spoken connectors of the target language to carry the flow, and contractions where the language has them.
 - Keep one note under roughly forty-five seconds of speech; split longer content into more than one `telegram_voice` comment.
 - If synthesis fails, the bridge falls back to a text reply on its own; never send the same content twice.
 
