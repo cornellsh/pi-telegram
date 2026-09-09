@@ -434,6 +434,42 @@ export function normalizeTelegramNativeMarkdown(markdown: string): string {
     .join("\n");
 }
 
+// Telegram's rich-markdown renderer draws a paragraph break (\n\n) as a single
+// line break, so multi-paragraph replies render with no visual gap. Inserting a
+// paragraph containing only a zero-width space BETWEEN two real paragraph
+// breaks gives Telegram an invisible one-character paragraph to draw, which
+// renders as an empty line. (Replacing the blank line itself does the opposite:
+// it soft-wraps the neighbors into one paragraph.) Fence-aware; code blocks
+// keep their literal blank lines.
+const ZERO_WIDTH_SPACE = "\u200B";
+export function forceTelegramBlankLines(markdown: string): string {
+  const out: string[] = [];
+  let fence: { marker: "`" | "~"; length: number } | undefined;
+  let pendingBlank = false;
+  for (const line of markdown.split("\n")) {
+    const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (!fence && line.trim().length === 0) {
+      pendingBlank = true;
+      continue;
+    }
+    if (pendingBlank) {
+      out.push("", ZERO_WIDTH_SPACE, "");
+      pendingBlank = false;
+    }
+    out.push(line);
+    if (!fence && fenceMatch) {
+      const markerText = fenceMatch[1] ?? "```";
+      fence = { marker: markerText[0] as "`" | "~", length: markerText.length };
+    } else if (
+      fence &&
+      new RegExp(`^ {0,3}${fence.marker}{${fence.length},}\\s*$`).test(line)
+    ) {
+      fence = undefined;
+    }
+  }
+  return out.join("\n");
+}
+
 export function splitTelegramNativeMarkdown(markdown: string): string[] {
   const normalizedMarkdown = normalizeTelegramNativeMarkdown(markdown);
   if (
@@ -441,7 +477,7 @@ export function splitTelegramNativeMarkdown(markdown: string): string[] {
     countTelegramNativeMarkdownBlocks(normalizedMarkdown) <=
       TELEGRAM_RICH_MESSAGE_MAX_BLOCKS
   ) {
-    return [normalizedMarkdown];
+    return [forceTelegramBlankLines(normalizedMarkdown)];
   }
   const chunks: string[] = [];
   let current = "";
@@ -475,7 +511,7 @@ export function splitTelegramNativeMarkdown(markdown: string): string[] {
     }
   }
   if (current) chunks.push(current.trimEnd());
-  return chunks;
+  return chunks.map(forceTelegramBlankLines);
 }
 
 function splitTelegramNativeMarkdownBlocks(markdown: string): string[] {
