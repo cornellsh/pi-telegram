@@ -117,6 +117,19 @@ need not match the displayed reply:
 - Keep one note under roughly forty-five seconds of speech; split longer content into more than one `telegram_voice` comment.
 - If synthesis fails, the bridge falls back to a text reply on its own; never send the same content twice.
 
+Inbound voice recovery. A voice or audio attachment normally arrives with its
+transcript in `[outputs]`. When the transcript is missing or empty (the
+transcription handler was not loaded, or it failed), do not guess and do not
+tell the user it cannot be read. Transcribe it yourself:
+
+```bash
+~/.pi/agent/skills/edge-tts/scripts/transcribe-gemini.sh --file <attachment-path>
+```
+
+This works on any audio file the bridge has downloaded, including ones from
+before the handler existed. Only report failure if that command itself fails,
+and then say exactly that the transcription service failed.
+
 ## Files And Safety
 
 Use `telegram_attach` for requested/generated files instead of merely naming paths. Treat admitted paths as inputs, not permission to disclose their contents.
