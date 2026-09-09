@@ -434,6 +434,35 @@ export function normalizeTelegramNativeMarkdown(markdown: string): string {
     .join("\n");
 }
 
+// Telegram's native-markdown renderer collapses a bare blank line (\n\n)
+// into a single line break, so paragraphs render with no gap. A line holding
+// only a zero-width space is non-empty to Telegram and survives as a real
+// blank line. Fence-aware: code blocks keep their literal blank lines.
+const ZERO_WIDTH_SPACE = "\u200B";
+export function forceTelegramBlankLines(markdown: string): string {
+  let fence: { marker: "`" | "~"; length: number } | undefined;
+  return markdown
+    .split("\n")
+    .map((line) => {
+      const fenceMatch = line.match(/^ {0,3}(`{3,}|~{3,})/);
+      if (!fence && fenceMatch) {
+        const markerText = fenceMatch[1] ?? "```";
+        fence = { marker: markerText[0] as "`" | "~", length: markerText.length };
+        return line;
+      }
+      if (
+        fence &&
+        new RegExp(`^ {0,3}${fence.marker}{${fence.length},}\\s*$`).test(line)
+      ) {
+        fence = undefined;
+        return line;
+      }
+      if (!fence && line.length === 0) return ZERO_WIDTH_SPACE;
+      return line;
+    })
+    .join("\n");
+}
+
 export function splitTelegramNativeMarkdown(markdown: string): string[] {
   const normalizedMarkdown = normalizeTelegramNativeMarkdown(markdown);
   if (
@@ -441,7 +470,7 @@ export function splitTelegramNativeMarkdown(markdown: string): string[] {
     countTelegramNativeMarkdownBlocks(normalizedMarkdown) <=
       TELEGRAM_RICH_MESSAGE_MAX_BLOCKS
   ) {
-    return [normalizedMarkdown];
+    return [forceTelegramBlankLines(normalizedMarkdown)];
   }
   const chunks: string[] = [];
   let current = "";
@@ -475,7 +504,7 @@ export function splitTelegramNativeMarkdown(markdown: string): string[] {
     }
   }
   if (current) chunks.push(current.trimEnd());
-  return chunks;
+  return chunks.map(forceTelegramBlankLines);
 }
 
 function splitTelegramNativeMarkdownBlocks(markdown: string): string[] {

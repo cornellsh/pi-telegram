@@ -22,6 +22,7 @@ import {
   dedupSendTextReply,
   editTelegramRenderedMessage,
   extractLatestAssistantMessageText,
+  forceTelegramBlankLines,
   getAgentMessageText,
   isAssistantAgentMessage,
   normalizeTelegramNativeMarkdown,
@@ -654,6 +655,9 @@ test("Native Markdown delivery preserves Bot API 10.2 structured blocks", async 
     .replace("> quoted evidence", ">quoted evidence");
 
   assert.equal(normalizeTelegramNativeMarkdown(source), expected);
+  // Blank lines outside fences are sent as a zero-width-space line so
+  // Telegram renders a real paragraph gap instead of collapsing \n\n.
+  const expectedSent = forceTelegramBlankLines(expected);
   const bodies: Array<Record<string, unknown>> = [];
   await sendTelegramNativeMarkdownReply(7, undefined, source, {
     sendRichMessage: async (body) => {
@@ -665,7 +669,7 @@ test("Native Markdown delivery preserves Bot API 10.2 structured blocks", async 
     {
       chat_id: 7,
       rich_message: {
-        markdown: expected,
+        markdown: expectedSent,
         skip_entity_detection: true,
       },
       reply_markup: undefined,
@@ -771,7 +775,8 @@ test("Native Markdown splitter keeps fenced code blocks together when possible",
     `${prefix}\n\n${codeBlock}\n\ntail`,
   );
   assert.equal(chunks.length, 2);
-  assert.equal(chunks[1], `${codeBlock}\n\ntail`);
+  // Blank line after the closing fence becomes a ZWSP line; the fence body is untouched.
+  assert.equal(chunks[1], `${codeBlock}\n\u200B\ntail`);
 });
 
 test("Native Markdown splitter rewraps oversized fenced code blocks", () => {
