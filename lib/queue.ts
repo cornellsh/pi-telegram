@@ -1354,6 +1354,24 @@ export function handleTelegramToolExecutionEndRuntime(
   if (hasActiveTurn) deps.triggerPendingModelSwitchAbort();
 }
 
+/**
+ * How long a retained error turn waits for a retry run to begin before it is
+ * finalized as a failure.
+ *
+ * An automatic compaction aborts the in-flight request, so the agent reports
+ * `stopReason: "error"` and settles, and only then does the post-compaction
+ * run start. Finalizing on that first settle delivered an empty reply and
+ * left the continuation with no turn to answer into, which is the "the agent
+ * never replied" symptom. Compaction of a large session was measured here at
+ * 36 seconds, so the window has to clear that comfortably.
+ *
+ * This waits for the retry rather than asking whether a compaction is in
+ * progress, because that answer depends on the order pi happens to emit the
+ * abort and the compaction hook, and an ordering assumption would break
+ * silently the day it changed.
+ */
+export const TELEGRAM_RETAINED_TURN_RETRY_GRACE_MS = 180_000;
+
 export type TelegramAgentLifecycleHooksRuntimeDeps<
   TTurn extends PendingTelegramTurn,
   TContext,
@@ -1361,7 +1379,12 @@ export type TelegramAgentLifecycleHooksRuntimeDeps<
   TReplyMarkup = unknown,
 > = TelegramAgentStartHookRuntimeDeps<TTurn, TContext> &
   TelegramAgentEndHookRuntimeDeps<TTurn, TContext, TMessage, TReplyMarkup> &
-  TelegramToolExecutionHookRuntimeDeps<TContext>;
+  TelegramToolExecutionHookRuntimeDeps<TContext> & {
+    /** Overridable for tests. Defaults to the global timer. */
+    retainedTurnRetryGraceMs?: number;
+    setRetryGraceTimer?: (fn: () => void, ms: number) => unknown;
+    clearRetryGraceTimer?: (handle: unknown) => void;
+  };
 
 export function createTelegramAgentLifecycleHooks<
   TTurn extends PendingTelegramTurn,
@@ -1384,8 +1407,51 @@ export function createTelegramAgentLifecycleHooks<
     TReplyMarkup
   >(deps);
   let retainedErrorEvent: TelegramAgentEndHookEvent<TMessage> | undefined;
+  // Set while a retained turn is waiting to see whether a retry run begins.
+  let retryGraceHandle: unknown;
+  const graceMs =
+    deps.retainedTurnRetryGraceMs ?? TELEGRAM_RETAINED_TURN_RETRY_GRACE_MS;
+  const startGraceTimer = (fn: () => void): unknown =>
+    deps.setRetryGraceTimer
+      ? deps.setRetryGraceTimer(fn, graceMs)
+      : setTimeout(fn, graceMs);
+  const cancelGraceTimer = (): void => {
+    if (retryGraceHandle === undefined) return;
+    const handle = retryGraceHandle;
+    retryGraceHandle = undefined;
+    if (deps.clearRetryGraceTimer) deps.clearRetryGraceTimer(handle);
+    else clearTimeout(handle as ReturnType<typeof setTimeout>);
+  };
+  const finalizeRetained = async (ctx: TContext): Promise<void> => {
+    const event = retainedErrorEvent;
+    if (!event) return;
+    retainedErrorEvent = undefined;
+    cancelGraceTimer();
+    deps.recordRuntimeEvent?.(
+      "provider-retry",
+      new Error("Finalized retained Telegram turn after agent settled"),
+      { phase: "settled-failure" },
+    );
+    await deliverAgentEnd(event, ctx);
+  };
   return {
-    onAgentStart,
+    async onAgentStart(
+      event: Parameters<typeof onAgentStart>[0],
+      ctx: Parameters<typeof onAgentStart>[1],
+    ): Promise<void> {
+      // A run beginning while a turn is retained is the retry we were waiting
+      // for. Stop the clock and let its own end decide the outcome, so a long
+      // post-compaction run is never cut off mid-flight.
+      if (retainedErrorEvent && retryGraceHandle !== undefined) {
+        cancelGraceTimer();
+        deps.recordRuntimeEvent?.(
+          "provider-retry",
+          new Error("Retained Telegram turn observed a retry run starting"),
+          { phase: "retry-started" },
+        );
+      }
+      return onAgentStart(event, ctx);
+    },
     async onAgentEnd(
       event: TelegramAgentEndHookEvent<TMessage>,
       ctx: TContext,
@@ -1394,6 +1460,7 @@ export function createTelegramAgentLifecycleHooks<
       const assistant = turn ? deps.extractAssistant(event.messages) : {};
       if (turn && assistant.stopReason === "error") {
         retainedErrorEvent = event;
+        cancelGraceTimer();
         deps.recordRuntimeEvent?.(
           "provider-retry",
           new Error("Retained Telegram turn after retryable agent error"),
@@ -1403,6 +1470,7 @@ export function createTelegramAgentLifecycleHooks<
       }
       if (retainedErrorEvent) {
         retainedErrorEvent = undefined;
+        cancelGraceTimer();
         deps.recordRuntimeEvent?.(
           "provider-retry",
           new Error("Recovered retained Telegram turn after agent retry"),
@@ -1412,18 +1480,27 @@ export function createTelegramAgentLifecycleHooks<
       await deliverAgentEnd(event, ctx, assistant);
     },
     async onAgentSettled(_event: unknown, ctx: TContext): Promise<void> {
-      const event = retainedErrorEvent;
-      if (!event) return;
-      retainedErrorEvent = undefined;
+      if (!retainedErrorEvent) return;
+      // Do not finalize yet. An automatic compaction aborts the request and
+      // settles the agent before restarting it, so finalizing here delivers an
+      // empty reply and orphans the continuation. Give the retry a bounded
+      // window to appear; if none does, fail loudly rather than hang forever.
+      if (retryGraceHandle !== undefined) return;
       deps.recordRuntimeEvent?.(
         "provider-retry",
-        new Error("Finalized retained Telegram turn after agent settled"),
-        { phase: "settled-failure" },
+        new Error("Retained Telegram turn awaiting a retry run"),
+        { phase: "awaiting-retry", graceMs },
       );
-      await deliverAgentEnd(event, ctx);
+      retryGraceHandle = startGraceTimer(() => {
+        retryGraceHandle = undefined;
+        void finalizeRetained(ctx);
+      });
+      // Node keeps the process alive for a pending timer; this one must not.
+      (retryGraceHandle as { unref?: () => void })?.unref?.();
     },
     clearRetainedAgentEnd(): void {
       retainedErrorEvent = undefined;
+      cancelGraceTimer();
     },
     ...createTelegramToolExecutionHooks<TContext>(deps),
   };

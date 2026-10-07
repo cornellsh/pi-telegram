@@ -3411,6 +3411,142 @@ for (const outcome of ["final", "error", "empty", "replacement", "config-failure
   });
 }
 
+/**
+ * Builds the lifecycle hooks with every port stubbed, a controllable retry
+ * grace timer, and a recorder that captures the provider-retry phases. The
+ * assistant outcome is switchable so a test can replay abort then retry.
+ */
+function createRetainedTurnHarness() {
+  const phases: string[] = [];
+  const delivered: string[] = [];
+  const turn: PendingTelegramTurn = createQueueTestPromptTurn();
+  let outcome: "error" | "ok" = "error";
+  let fire: (() => void) | undefined;
+  const hooks = createTelegramAgentLifecycleHooks<
+    PendingTelegramTurn,
+    { id: string },
+    string
+  >({
+    setRetryGraceTimer: (fn) => {
+      fire = fn;
+      return { handle: true };
+    },
+    clearRetryGraceTimer: () => {
+      fire = undefined;
+    },
+    recordRuntimeEvent: (_category, _error, details) => {
+      phases.push(String((details as { phase?: unknown })?.phase));
+    },
+    getActiveTurn: () => turn,
+    extractAssistant: () =>
+      outcome === "error"
+        ? { stopReason: "error" as const, text: "" }
+        : { text: "recovered final" },
+    getFoldQueuedPromptsIntoHistory: () => false,
+    resetRuntimeState: () => {},
+    updateStatus: () => {},
+    dispatchNextQueuedTelegramTurn: () => {},
+    requestDeferredDispatchNextQueuedTelegramTurn: () => {},
+    clearPreview: async () => {},
+    setPreviewPendingText: () => {},
+    finalizeMarkdownPreview: async (_chatId, markdown) => {
+      delivered.push(`finalize:${markdown}`);
+      return true;
+    },
+    sendMarkdownReply: async () => {
+      delivered.push("markdown");
+    },
+    sendTextReply: async () => {
+      delivered.push("text");
+    },
+    sendQueuedAttachments: async () => {},
+    setAbortHandler: () => {},
+    getQueuedItems: () => [],
+    hasPendingDispatch: () => false,
+    hasActiveTurn: () => true,
+    resetToolExecutions: () => {},
+    resetPendingModelSwitch: () => {},
+    setQueuedItems: () => {},
+    clearDispatchPending: () => {},
+    setFoldQueuedPromptsIntoHistory: () => {},
+    setActiveTurn: () => {},
+    createPreviewState: () => {},
+    startTypingLoop: () => {},
+    getActiveToolExecutions: () => 0,
+    setActiveToolExecutions: () => {},
+    triggerPendingModelSwitchAbort: () => {},
+  });
+  return {
+    hooks,
+    phases,
+    delivered,
+    setOutcome: (next: "error" | "ok") => {
+      outcome = next;
+    },
+    expireGrace: () => {
+      const pending = fire;
+      fire = undefined;
+      pending?.();
+    },
+    graceArmed: () => fire !== undefined,
+  };
+}
+
+test("A compaction abort does not finalize the turn before its retry runs", async () => {
+  const h = createRetainedTurnHarness();
+  const ctx = { id: "ctx" };
+
+  // The compaction aborts the request: the agent reports an error, then
+  // settles before the post-compaction run begins.
+  await h.hooks.onAgentEnd({ messages: ["x"] }, ctx);
+  await h.hooks.onAgentSettled({}, ctx);
+  assert.deepEqual(h.phases, ["retained", "awaiting-retry"]);
+  assert.deepEqual(
+    h.delivered,
+    [],
+    "settling must not deliver an empty reply while a retry may still come",
+  );
+  assert.ok(h.graceArmed(), "the wait must be bounded by a timer");
+
+  // The retry starts, so the clock stops and its own end delivers the answer.
+  await h.hooks.onAgentStart({}, ctx);
+  assert.ok(!h.graceArmed(), "a started retry must cancel the grace timer");
+  h.setOutcome("ok");
+  await h.hooks.onAgentEnd({ messages: ["y"] }, ctx);
+  assert.deepEqual(h.phases, [
+    "retained",
+    "awaiting-retry",
+    "retry-started",
+    "recovered",
+  ]);
+  assert.deepEqual(h.delivered, ["finalize:recovered final"]);
+});
+
+test("A retained turn that never retries still fails loudly", async () => {
+  const h = createRetainedTurnHarness();
+  const ctx = { id: "ctx" };
+  await h.hooks.onAgentEnd({ messages: ["x"] }, ctx);
+  await h.hooks.onAgentSettled({}, ctx);
+  assert.deepEqual(h.delivered, []);
+
+  // No retry arrives, so the bounded wait expires and the turn is finalized
+  // rather than left hanging forever.
+  h.expireGrace();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(h.phases, ["retained", "awaiting-retry", "settled-failure"]);
+  assert.equal(h.delivered.length, 1);
+});
+
+test("Repeated settles while awaiting a retry do not stack timers", async () => {
+  const h = createRetainedTurnHarness();
+  const ctx = { id: "ctx" };
+  await h.hooks.onAgentEnd({ messages: ["x"] }, ctx);
+  await h.hooks.onAgentSettled({}, ctx);
+  await h.hooks.onAgentSettled({}, ctx);
+  await h.hooks.onAgentSettled({}, ctx);
+  assert.deepEqual(h.phases, ["retained", "awaiting-retry"]);
+});
+
 test("Agent end hook binds assistant extraction and runtime ports", async () => {
   const events: string[] = [];
   const turn: PendingTelegramTurn = createQueueTestPromptTurn();
@@ -3780,6 +3916,7 @@ test("Agent lifecycle hooks bind start, end, and tool lifecycle ports", async ()
 
 test("Agent lifecycle retains retryable errors until recovery or settlement", async () => {
   const events: string[] = [];
+  let expireRetryGrace: (() => void) | undefined;
   const turn = createQueueTestPromptTurn({ chatId: 7, replyToMessageId: 8 });
   let activeTurn: PendingTelegramTurn | undefined = turn;
   const hooks = createTelegramAgentLifecycleHooks<
@@ -3839,6 +3976,13 @@ test("Agent lifecycle retains retryable errors until recovery or settlement", as
     recordRuntimeEvent: (category, _error, details) => {
       events.push(`${category}:${details?.phase}`);
     },
+    setRetryGraceTimer: (fn) => {
+      expireRetryGrace = fn;
+      return { handle: true };
+    },
+    clearRetryGraceTimer: () => {
+      expireRetryGrace = undefined;
+    },
   });
 
   await hooks.onAgentEnd({ messages: [{ result: "error" }] }, "ctx");
@@ -3861,9 +4005,22 @@ test("Agent lifecycle retains retryable errors until recovery or settlement", as
   events.length = 0;
   await hooks.onAgentEnd({ messages: [{ result: "error" }] }, "ctx");
   await hooks.onAgentSettled({}, "ctx");
+  // Settling only arms the bounded wait. An automatic compaction aborts the
+  // request and settles the agent before restarting it, so delivering here
+  // would send an empty reply and orphan the post-compaction run.
+  assert.equal(activeTurn, turn, "the turn stays open while a retry may come");
+  assert.deepEqual(events, [
+    "provider-retry:retained",
+    "provider-retry:awaiting-retry",
+  ]);
+
+  // No retry arrives, so the wait expires and the error is delivered.
+  expireRetryGrace?.();
+  await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(activeTurn, undefined);
   assert.deepEqual(events, [
     "provider-retry:retained",
+    "provider-retry:awaiting-retry",
     "provider-retry:settled-failure",
     "reset",
     "clear",
