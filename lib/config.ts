@@ -125,6 +125,12 @@ export interface TelegramConfig {
     /** Delete this instance's bound Telegram thread on graceful Pi quit. */
     automaticCleanup?: boolean;
   };
+  /**
+   * Connect new interactive sessions to Telegram without /telegram-connect.
+   * Absent means off: connecting unasked creates a Telegram topic, so it is
+   * opt-in. See lib/auto-connect.ts for the rules it still refuses on.
+   */
+  autoConnect?: boolean;
   /** Canonical bot/session profiles, including profiles.default. */
   profiles?: Record<string, TelegramBotProfile>;
 }
@@ -988,6 +994,20 @@ export function createTelegramAutomaticThreadCleanupChecker(
   return () => configStore.get().threads?.automaticCleanup ?? true;
 }
 
+/**
+ * Whether new interactive sessions connect without /telegram-connect.
+ *
+ * Defaults to false, unlike automaticCleanup: connecting unasked creates a
+ * Telegram topic that someone has to notice and delete, so the safe default
+ * is to do nothing. Strict equality keeps a stray string or number from
+ * reading as on.
+ */
+export function createTelegramAutoConnectChecker(
+  configStore: Pick<TelegramConfigStore, "get">,
+): () => boolean {
+  return () => configStore.get().autoConnect === true;
+}
+
 export function createTelegramAutomaticThreadCleanupResolver(
   configStore: TelegramMutableConfigStore,
 ): () => Promise<boolean> {
@@ -1039,6 +1059,7 @@ export function createTelegramConfigControls(
     setVoiceReplyMode: createTelegramVoiceReplyModeSetter(configStore),
     getTimeInjectionMode: createTelegramTimeInjectionModeGetter(configStore),
     setTimeInjectionMode: createTelegramTimeInjectionModeSetter(configStore),
+    isAutoConnectEnabled: createTelegramAutoConnectChecker(configStore),
     isAutomaticThreadCleanupEnabled:
       createTelegramAutomaticThreadCleanupChecker(configStore),
     resolveAutomaticThreadCleanupEnabled:

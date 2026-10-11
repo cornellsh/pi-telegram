@@ -6,6 +6,7 @@
 
 import * as Activity from "./activity.ts";
 import * as ActivityVerbosity from "./activity-verbosity.ts";
+import * as AutoConnect from "./auto-connect.ts";
 import * as CommandTemplates from "./command-templates.ts";
 import * as Commands from "./commands.ts";
 import * as Config from "./config.ts";
@@ -489,6 +490,14 @@ export function createTelegramActivityBindingRuntime<TTransportStamp>(deps: {
 
 interface TelegramCommandsAndToolsBindingDeps {
   pi: Pi.ExtensionAPI;
+  /**
+   * Receives the /telegram-connect handler as it is registered, so
+   * auto-connect runs that exact path instead of a second implementation of
+   * it. The command already handles profile activation, missing credentials,
+   * polling recovery and leader takeover; a parallel copy would drift, and
+   * the drift would only surface in those cases.
+   */
+  connectCommandHolder?: AutoConnect.TelegramConnectCommandHolder;
   agentDir: string;
   configStore: Config.TelegramConfigStore;
   persistConfig: (config?: Config.TelegramConfig) => Promise<void>;
@@ -524,6 +533,7 @@ interface TelegramCommandsAndToolsBindingDeps {
 
 export function registerTelegramCommandsAndTools({
   pi,
+  connectCommandHolder,
   agentDir,
   configStore,
   persistConfig,
@@ -593,6 +603,12 @@ export function registerTelegramCommandsAndTools({
     );
   };
   Commands.registerTelegramBridgeCommands(pi, {
+    onConnectCommandRegistered: connectCommandHolder
+      ? (handler) =>
+          connectCommandHolder.capture(
+            handler as AutoConnect.TelegramConnectCommandHandler,
+          )
+      : undefined,
     promptForConfig: async (ctx, profileName) => {
       const nextProfileName = profileName ?? undefined;
       if (profileName && !Config.isValidTelegramProfileName(profileName)) {
@@ -795,6 +811,13 @@ interface TelegramLifecycleBindingDeps {
     target?: Queue.TelegramQueueTarget;
   }) => void;
   canSendAgentActivity: (ctx: Pi.ExtensionContext) => boolean;
+  /**
+   * Appended to this binding's session-start hook rather than registering its
+   * own listener. Optional so the bridge runs unchanged without it.
+   */
+  autoConnectRuntime?: {
+    onSessionStart: (mode: string, ctx: Pi.ExtensionContext) => void;
+  };
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
   updateStatus: TelegramBridgeStatusUpdater;
@@ -808,6 +831,7 @@ export function registerTelegramLifecycleRuntimeHooks({
   activityVerbosityRuntime,
   assistantOutputRuntime,
   sessionLifecycleRuntime,
+  autoConnectRuntime,
   configStore,
   abort,
   typing,
@@ -1136,6 +1160,12 @@ export function registerTelegramLifecycleRuntimeHooks({
       activityVerbosityRuntime?.reset();
       modelContextAvailabilityRuntime.reconcile();
       await sessionLifecycleRuntime.onSessionStart(event, ctx);
+      // Last, and appended here rather than given its own pi.on listener:
+      // handler registries key by event name, so a second session_start
+      // listener can silently replace this one. Running after the bridge has
+      // started also means a restored binding is already visible, so a reload
+      // does not reconnect over itself.
+      autoConnectRuntime?.onSessionStart(ctx.mode, ctx);
     },
     async onSessionShutdown(event, ctx) {
       if (!isSessionContextActive(ctx)) return;

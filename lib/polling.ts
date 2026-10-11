@@ -197,6 +197,19 @@ export function createTelegramPollingActivityReader(
   return () => isTelegramPollingControllerActive(state);
 }
 
+/**
+ * Whether this process has a Telegram binding at all, as leader or follower.
+ *
+ * Both halves matter. A follower never polls, so polling alone would read as
+ * disconnected and invite a second connection that replaces a live thread.
+ */
+export function createTelegramConnectedReader(deps: {
+  isPollingActive: () => boolean;
+  isFollowerRegistered: () => boolean;
+}): () => boolean {
+  return () => deps.isPollingActive() || deps.isFollowerRegistered();
+}
+
 export interface TelegramPollingRuntimeDeps<
   TContext,
 > extends TelegramRuntimeEventRecorderPort {

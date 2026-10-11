@@ -351,6 +351,16 @@ export interface TelegramBridgeCommandRegistrationDeps {
   ) => Promise<TelegramPollingStartRecoveryResult>;
   getDisconnectThreadName?: () => string | undefined;
   queueAgentConnectionContext?: (connected: boolean) => void;
+  /**
+   * Receives the /telegram-connect handler as it is registered, so automatic
+   * connection runs this exact path rather than a second implementation of
+   * it. Everything below (profile activation, missing credentials, polling
+   * recovery, leader takeover) would otherwise have to be duplicated, and the
+   * duplicate would only diverge in those cases.
+   */
+  onConnectCommandRegistered?: (
+    handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>,
+  ) => void;
   updateStatus: (ctx: ExtensionCommandContext) => void;
   getProfileNames?: () => string[];
   activateDefaultProfileConfig?: (ctx: ExtensionCommandContext) => Promise<void>;
@@ -402,9 +412,11 @@ export function registerTelegramBridgeCommands(
       ctx.ui.notify(deps.getStatusLines({ verbose }).join("\n"), "info");
     },
   });
-  pi.registerCommand("telegram-connect", {
-    description: "Start the Telegram bridge. Use /telegram-connect <name> for named profiles.",
-    handler: async (args, ctx) => {
+  const connectCommandHandler = async (
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> => {
+    {
       const profileName = parseTelegramProfileArg(args);
       if (profileName && deps.activateProfileConfig) {
         const ok = await deps.activateProfileConfig(ctx, profileName);
@@ -489,7 +501,12 @@ export function registerTelegramBridgeCommands(
         deps.queueAgentConnectionContext?.(true);
       }
       deps.updateStatus(ctx);
-    },
+    }
+  };
+  deps.onConnectCommandRegistered?.(connectCommandHandler);
+  pi.registerCommand("telegram-connect", {
+    description: "Start the Telegram bridge. Use /telegram-connect <name> for named profiles.",
+    handler: connectCommandHandler,
   });
   pi.registerCommand("telegram-disconnect", {
     description:

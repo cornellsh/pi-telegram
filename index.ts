@@ -5,6 +5,7 @@
  */
 
 import * as AgentMessages from "./lib/agent-messages.ts";
+import * as AutoConnect from "./lib/auto-connect.ts";
 import * as Bindings from "./lib/bindings.ts";
 import * as BusApi from "./lib/bus-api.ts";
 import * as BusFollower from "./lib/bus-follower.ts";
@@ -48,6 +49,7 @@ import * as ThreadReconciler from "./lib/thread-reconciler.ts";
 import * as Threads from "./lib/threads.ts";
 import * as TimeInjection from "./lib/time-injection.ts";
 import * as Updates from "./lib/updates.ts";
+import * as VoiceEdgeTts from "./lib/voice-edge-tts.ts";
 import * as Voice from "./lib/voice.ts";
 
 type ActivePiModel = NonNullable<Pi.ExtensionContext["model"]>;
@@ -293,6 +295,24 @@ export default function (pi: Pi.ExtensionAPI) {
       recordRuntimeEvent,
     });
   const pollingControllerState = Polling.createTelegramPollingControllerState();
+  // Shared so auto-connect and the status reader agree on what "connected"
+  // means; two separate notions of it would disagree exactly when it matters.
+  const isPollingActiveReader = Polling.createTelegramPollingActivityReader(
+    pollingControllerState,
+  );
+  const telegramConnectCommandHolder =
+    AutoConnect.createTelegramConnectCommandHolder();
+  const telegramAutoConnectRuntime =
+    AutoConnect.createTelegramAutoConnectSessionRuntime<Pi.ExtensionContext>({
+      isAutoConnectEnabled: Config.createTelegramAutoConnectChecker(configStore),
+      hasBotToken: configStore.hasBotToken,
+      isConnected: Polling.createTelegramConnectedReader({
+        isPollingActive: isPollingActiveReader,
+        isFollowerRegistered: telegramBusFollowerRegistrationState.isRegistered,
+      }),
+      getConnectHandler: telegramConnectCommandHolder.get,
+      recordRuntimeEvent,
+    });
   const telegramSyncStateRuntime = Sync.createTelegramSyncStateRuntime();
   const threadReconciliationRuntime =
     ThreadReconciler.createThreadReconciliationRuntime({
@@ -342,9 +362,7 @@ export default function (pi: Pi.ExtensionAPI) {
     getConfig: configStore.get,
     getActiveProfileName: configStore.getActiveProfileName,
     getDiagnosticPaths: Paths.getTelegramDiagnosticsDisplayPaths,
-    isPollingActive: Polling.createTelegramPollingActivityReader(
-      pollingControllerState,
-    ),
+    isPollingActive: isPollingActiveReader,
     getPollingState: Polling.createTelegramPollingStateReader(
       pollingControllerState,
     ),
@@ -1315,6 +1333,7 @@ export default function (pi: Pi.ExtensionAPI) {
 
   Bindings.registerTelegramCommandsAndTools({
     pi,
+    connectCommandHolder: telegramConnectCommandHolder,
     agentDir: Paths.resolveAgentDir(),
     configStore,
     persistConfig: persistTelegramConfigWithSync,
@@ -1361,6 +1380,7 @@ export default function (pi: Pi.ExtensionAPI) {
 
   Bindings.registerTelegramLifecycleRuntimeHooks({
     pi,
+    autoConnectRuntime: telegramAutoConnectRuntime,
     sessionLifecycleRuntime: {
       ...sessionLifecycleRuntime,
       onModelSelect: currentModelRuntime.onModelSelect,
@@ -1418,4 +1438,13 @@ export default function (pi: Pi.ExtensionAPI) {
     updateStatus,
     recordRuntimeEvent,
   });
+
+  Voice.registerTelegramVoiceSynthesisProvider(
+    VoiceEdgeTts.createTelegramEdgeTtsVoiceSynthesisProvider({
+      agentDir: Paths.resolveAgentDir(),
+      recordRuntimeEvent,
+    }),
+    { id: "edge-tts-say" },
+  );
 }
+
