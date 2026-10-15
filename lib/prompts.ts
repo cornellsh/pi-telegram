@@ -164,7 +164,11 @@ type TelegramBeforeAgentStartHook = (
 ) => TelegramBeforeAgentStartResult;
 
 export function buildTelegramBridgeSystemPrompt(options: {
-  prompt: string;
+  // Optional, not string. `before_agent_start` only carries `prompt` when
+  // `messageType === "user"`. A run started by `pi.sendMessage(..., {
+  // triggerTurn: true })` reports `messageType: "custom"` and no prompt at
+  // all, which crashed this hook on `.trimStart()`.
+  prompt?: string;
   systemPrompt?: TelegramSystemPrompt | null;
   telegramPrefix?: string;
   localSystemPromptSuffix: string;
@@ -175,7 +179,9 @@ export function buildTelegramBridgeSystemPrompt(options: {
   const telegramHead = telegramPrefix.endsWith("]")
     ? telegramPrefix.slice(0, -1)
     : telegramPrefix;
-  const trimmedPrompt = options.prompt.trimStart();
+  // A custom-triggered run has no prompt to inspect, so it can never be a
+  // Telegram turn; treat it as local rather than throwing.
+  const trimmedPrompt = (options.prompt ?? "").trimStart();
   const telegramTurn =
     trimmedPrompt.startsWith(`${telegramHead}]`) ||
     trimmedPrompt.startsWith(`${telegramHead}|`);

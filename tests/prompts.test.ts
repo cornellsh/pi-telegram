@@ -49,6 +49,13 @@ test("Prompt hooks normalize missing and null system prompts without losing Tele
   assert.deepEqual(buildTelegramBridgeSystemPrompt({
     prompt: "local", localSystemPromptSuffix: "suffix", telegramTurnSystemPromptSuffix: "telegram",
   }), { systemPrompt: "suffix" });
+
+  // A run started by pi.sendMessage(..., { triggerTurn: true }) reports
+  // messageType "custom" and carries no prompt. Treat it as a local turn
+  // instead of throwing on undefined.
+  assert.deepEqual(buildTelegramBridgeSystemPrompt({
+    systemPrompt: "base", localSystemPromptSuffix: "suffix", telegramTurnSystemPromptSuffix: "telegram",
+  }), { systemPrompt: "basesuffix" });
 });
 
 test("Prompt helpers append context-aware system prompt suffixes", () => {
