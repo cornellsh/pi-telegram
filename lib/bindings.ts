@@ -498,6 +498,12 @@ interface TelegramCommandsAndToolsBindingDeps {
    * the drift would only surface in those cases.
    */
   connectCommandHolder?: AutoConnect.TelegramConnectCommandHolder;
+  /**
+   * Called when the operator disconnects on purpose, so the reconnect watch
+   * stops. Without it the supervisor would notice the missing binding a
+   * minute later and recreate the topic they asked to delete.
+   */
+  onManualDisconnect?: () => void;
   agentDir: string;
   configStore: Config.TelegramConfigStore;
   persistConfig: (config?: Config.TelegramConfig) => Promise<void>;
@@ -534,6 +540,7 @@ interface TelegramCommandsAndToolsBindingDeps {
 export function registerTelegramCommandsAndTools({
   pi,
   connectCommandHolder,
+  onManualDisconnect,
   agentDir,
   configStore,
   persistConfig,
@@ -693,7 +700,13 @@ export function registerTelegramCommandsAndTools({
         throw error;
       }
     },
-    stopPolling: stopPolling ?? lockedPollingRuntime.stop,
+    // A deliberate disconnect switches the reconnect watch off. Without this
+    // the supervisor would notice the missing binding a minute later and
+    // recreate the very topic the operator asked to delete.
+    stopPolling: async () => {
+      onManualDisconnect?.();
+      return (stopPolling ?? lockedPollingRuntime.stop)();
+    },
     recoverPollingStart,
     getDisconnectThreadName,
     queueAgentConnectionContext,
@@ -817,6 +830,7 @@ interface TelegramLifecycleBindingDeps {
    */
   autoConnectRuntime?: {
     onSessionStart: (mode: string, ctx: Pi.ExtensionContext) => void;
+    onManualDisconnect: () => void;
   };
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;

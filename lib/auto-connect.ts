@@ -181,6 +181,175 @@ export function createTelegramConnectCommandHolder(): TelegramConnectCommandHold
   };
 }
 
+/**
+ * How often the supervisor checks that the binding is still there.
+ *
+ * A session only gets one automatic attempt at session_start, deliberately,
+ * so a reload cannot tear down a thread mid-conversation. That left no path
+ * back from a binding LOST later: a leader restart reclaims the topics of live
+ * follower sessions, and those sessions then sat disconnected forever with the
+ * agent still running and the operator still typing into it. Three of eight
+ * sessions were in that state when this was written.
+ *
+ * Losing a binding is a different event from starting a session, and it needs
+ * its own trigger rather than a longer list of conditions on the first one.
+ */
+export const TELEGRAM_AUTO_CONNECT_WATCH_MS = 60_000;
+
+export interface TelegramAutoConnectSupervisorDeps
+  extends TelegramAutoConnectSessionRuntimeDeps {
+  setTimer: (fn: () => void, ms: number) => unknown;
+  clearTimer: (handle: unknown) => void;
+  watchIntervalMs?: number;
+}
+
+export interface TelegramAutoConnectSupervisor {
+  /** Begin watching. Safe to call more than once; later calls are no-ops. */
+  start: () => void;
+  /** Stop watching until start() is called again. */
+  suspend: (reason: string) => void;
+  stop: () => void;
+  /** Exposed for tests: run one check now. */
+  check: () => Promise<void>;
+}
+
+/**
+ * Restore a binding that was lost after the session started.
+ *
+ * Deliberately narrow about what counts as lost. A manual /telegram-disconnect
+ * suspends it: reconnecting a session the operator just disconnected would be
+ * the bridge arguing with them, and it would recreate the very topic they
+ * asked to delete. Only start() resumes it.
+ */
+export function createTelegramAutoConnectSupervisor<TContext>(
+  deps: TelegramAutoConnectSupervisorDeps,
+  getContext: () => TContext | undefined,
+): TelegramAutoConnectSupervisor {
+  const intervalMs = deps.watchIntervalMs ?? TELEGRAM_AUTO_CONNECT_WATCH_MS;
+  let handle: unknown;
+  let running = false;
+  let suspended = false;
+  let consecutiveFailures = 0;
+
+  const schedule = (): void => {
+    if (suspended || handle !== undefined) return;
+    handle = deps.setTimer(() => {
+      handle = undefined;
+      void check().finally(schedule);
+    }, intervalMs);
+    (handle as { unref?: () => void })?.unref?.();
+  };
+
+  const check = async (): Promise<void> => {
+    // One reconnect at a time. The attempt itself runs a bounded backoff that
+    // can outlast the watch interval, and two overlapping connects would race
+    // to create a topic each.
+    if (suspended || running) return;
+    if (!deps.isAutoConnectEnabled() || !deps.hasBotToken()) return;
+    if (deps.isConnected()) {
+      consecutiveFailures = 0;
+      return;
+    }
+    const ctx = getContext();
+    const handler = deps.getConnectHandler();
+    if (!ctx || !handler) return;
+    running = true;
+    try {
+      deps.recordRuntimeEvent(
+        "auto-connect",
+        new Error("Telegram binding lost; reconnecting"),
+        { phase: "binding-lost", attempt: consecutiveFailures + 1 },
+      );
+      const outcome = await runTelegramAutoConnect({
+        connect: async () => {
+          await handler("", ctx as never);
+        },
+        isConnected: deps.isConnected,
+        sleep: deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))),
+        backoffMs: deps.backoffMs,
+        recordRuntimeEvent: deps.recordRuntimeEvent,
+      });
+      if (outcome === "gave-up") {
+        consecutiveFailures += 1;
+        // Keep watching rather than giving up for good: the usual cause is a
+        // leader restart, and the next check is the recovery. Logged on a
+        // widening scale so a persistent failure is visible without a line a
+        // minute forever.
+        if ([1, 5, 20, 60].includes(consecutiveFailures)) {
+          deps.recordRuntimeEvent(
+            "auto-connect",
+            new Error(
+              `Telegram reconnect has failed ${consecutiveFailures} time(s); still watching`,
+            ),
+            { phase: "reconnect-failing", consecutiveFailures },
+          );
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
+    } finally {
+      running = false;
+    }
+  };
+
+  return {
+    start() {
+      suspended = false;
+      schedule();
+    },
+    suspend(reason: string) {
+      suspended = true;
+      if (handle !== undefined) {
+        deps.clearTimer(handle);
+        handle = undefined;
+      }
+      deps.recordRuntimeEvent(
+        "auto-connect",
+        new Error(`Telegram auto-reconnect suspended: ${reason}`),
+        { phase: "supervisor-suspended", reason },
+      );
+    },
+    stop() {
+      suspended = true;
+      if (handle !== undefined) {
+        deps.clearTimer(handle);
+        handle = undefined;
+      }
+    },
+    check,
+  };
+}
+
+/**
+ * The whole auto-connect binding: first attempt, plus the watch that restores
+ * a binding lost later. Assembled here rather than in the entrypoint, which is
+ * a composition root and holds no state or timers of its own.
+ */
+export function createTelegramAutoConnectBinding<TContext>(
+  deps: TelegramAutoConnectSessionRuntimeDeps & { watchIntervalMs?: number },
+): {
+  onSessionStart: (mode: string, ctx: TContext) => void;
+  onManualDisconnect: () => void;
+} {
+  let liveContext: TContext | undefined;
+  const supervisor = createTelegramAutoConnectSupervisor<TContext>(
+    {
+      ...deps,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+      watchIntervalMs: deps.watchIntervalMs,
+    },
+    () => liveContext,
+  );
+  return createTelegramAutoConnectSessionRuntime<TContext>({
+    ...deps,
+    supervisor,
+    rememberContext: (ctx) => {
+      liveContext = ctx;
+    },
+  });
+}
+
 export interface TelegramAutoConnectSessionRuntimeDeps {
   isAutoConnectEnabled: () => boolean;
   hasBotToken: () => boolean;
@@ -208,8 +377,16 @@ export interface TelegramAutoConnectSessionRuntimeDeps {
  * restored binding is visible, so a reload does not reconnect over itself.
  */
 export function createTelegramAutoConnectSessionRuntime<TContext>(
-  deps: TelegramAutoConnectSessionRuntimeDeps,
-): { onSessionStart: (mode: string, ctx: TContext) => void } {
+  deps: TelegramAutoConnectSessionRuntimeDeps & {
+    /** Watches for a binding lost after startup. */
+    supervisor?: TelegramAutoConnectSupervisor;
+    /** Records the live context so the supervisor can reconnect with it. */
+    rememberContext?: (ctx: TContext) => void;
+  },
+): {
+  onSessionStart: (mode: string, ctx: TContext) => void;
+  onManualDisconnect: () => void;
+} {
   let attempted = false;
   const sleep =
     deps.sleep ??
@@ -228,6 +405,10 @@ export function createTelegramAutoConnectSessionRuntime<TContext>(
         hasBotToken: deps.hasBotToken(),
         alreadyAttempted: attempted,
       });
+      // Remembered even when the decision is to skip: an already-connected
+      // session is exactly one that can lose its binding later, and the
+      // supervisor needs a context to reconnect with.
+      deps.rememberContext?.(ctx);
       if (decision.kind === "skip") {
         // "disabled" is the configured default, not a problem to report.
         if (decision.reason !== "disabled") {
@@ -236,6 +417,11 @@ export function createTelegramAutoConnectSessionRuntime<TContext>(
             new Error(`Telegram auto-connect skipped: ${decision.reason}`),
             { phase: "skipped", reason: decision.reason },
           );
+        }
+        // Still worth watching when the only objection was that it is
+        // already connected; every other refusal means it never should be.
+        if (decision.reason === "already-connected" || decision.reason === "already-attempted") {
+          deps.supervisor?.start();
         }
         return;
       }
@@ -259,7 +445,12 @@ export function createTelegramAutoConnectSessionRuntime<TContext>(
         sleep,
         backoffMs: deps.backoffMs,
         recordRuntimeEvent: deps.recordRuntimeEvent,
-      });
+      }).then(() => deps.supervisor?.start());
+    },
+    onManualDisconnect() {
+      // The operator asked for this. Reconnecting would argue with them and
+      // recreate the topic they just deleted.
+      deps.supervisor?.suspend("manual disconnect");
     },
   };
 }

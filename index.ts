@@ -303,7 +303,7 @@ export default function (pi: Pi.ExtensionAPI) {
   const telegramConnectCommandHolder =
     AutoConnect.createTelegramConnectCommandHolder();
   const telegramAutoConnectRuntime =
-    AutoConnect.createTelegramAutoConnectSessionRuntime<Pi.ExtensionContext>({
+    AutoConnect.createTelegramAutoConnectBinding<Pi.ExtensionContext>({
       isAutoConnectEnabled: Config.createTelegramAutoConnectChecker(configStore),
       hasBotToken: configStore.hasBotToken,
       isConnected: Polling.createTelegramConnectedReader({
@@ -1334,6 +1334,7 @@ export default function (pi: Pi.ExtensionAPI) {
   Bindings.registerTelegramCommandsAndTools({
     pi,
     connectCommandHolder: telegramConnectCommandHolder,
+    onManualDisconnect: telegramAutoConnectRuntime.onManualDisconnect,
     agentDir: Paths.resolveAgentDir(),
     configStore,
     persistConfig: persistTelegramConfigWithSync,

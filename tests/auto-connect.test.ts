@@ -7,11 +7,147 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createTelegramAutoConnectSupervisor,
   planTelegramAutoConnect,
   runTelegramAutoConnect,
   TELEGRAM_AUTO_CONNECT_BACKOFF_MS,
   type TelegramAutoConnectInput,
 } from "../lib/auto-connect.ts";
+
+/**
+ * Supervisor with a hand-driven clock and a connect whose outcome the test
+ * controls, so every branch is reachable without timers or a network.
+ */
+function supervisorHarness(
+  options: { connectSucceeds?: boolean; enabled?: boolean } = {},
+) {
+  let connected = false;
+  let connects = 0;
+  const phases: string[] = [];
+  let fire: (() => void) | undefined;
+  const deps = {
+    isAutoConnectEnabled: () => options.enabled ?? true,
+    hasBotToken: () => true,
+    isConnected: () => connected,
+    getConnectHandler: () => async () => {
+      connects += 1;
+      if (options.connectSucceeds !== false) connected = true;
+    },
+    recordRuntimeEvent: (_c: string, _e: unknown, d?: Record<string, unknown>) => {
+      phases.push(String(d?.phase));
+    },
+    sleep: async () => {},
+    backoffMs: [0] as readonly number[],
+    setTimer: (fn: () => void) => {
+      fire = fn;
+      return { unref() {} };
+    },
+    clearTimer: () => {
+      fire = undefined;
+    },
+  };
+  const sup = createTelegramAutoConnectSupervisor(deps, () => ({ id: "ctx" }));
+  return {
+    sup,
+    phases,
+    connects: () => connects,
+    setConnected: (v: boolean) => {
+      connected = v;
+    },
+    isConnected: () => connected,
+    armed: () => fire !== undefined,
+    tick: async () => {
+      const f = fire;
+      fire = undefined;
+      f?.();
+      await new Promise((r) => setTimeout(r, 0));
+    },
+  };
+}
+
+test("A binding lost after startup is reconnected", async () => {
+  // The case this exists for: a leader restart reclaims a live session's
+  // topic, and nothing else would ever bring it back.
+  const h = supervisorHarness();
+  h.setConnected(true);
+  h.sup.start();
+
+  await h.sup.check();
+  assert.equal(h.connects(), 0, "a healthy binding is left alone");
+
+  h.setConnected(false);
+  await h.sup.check();
+  assert.equal(h.connects(), 1);
+  assert.ok(h.isConnected());
+  assert.ok(h.phases.includes("binding-lost"));
+});
+
+test("A manual disconnect is not undone by the supervisor", async () => {
+  // Reconnecting here would argue with the operator and recreate the topic
+  // they just asked to delete.
+  const h = supervisorHarness();
+  h.sup.start();
+  h.sup.suspend("manual disconnect");
+  h.setConnected(false);
+
+  await h.sup.check();
+  assert.equal(h.connects(), 0, "suspended means suspended");
+  assert.ok(!h.armed(), "and the timer is cancelled, not left running");
+  assert.ok(h.phases.includes("supervisor-suspended"));
+
+  // Only an explicit start resumes it.
+  h.sup.start();
+  await h.sup.check();
+  assert.equal(h.connects(), 1);
+});
+
+test("Reconnects do not overlap or stack timers", async () => {
+  const h = supervisorHarness();
+  h.sup.start();
+  const armedOnce = h.armed();
+  h.sup.start();
+  h.sup.start();
+  assert.ok(armedOnce && h.armed(), "repeat starts must not stack timers");
+
+  h.setConnected(false);
+  // Three checks dispatched together must produce one connect, not three.
+  await Promise.all([h.sup.check(), h.sup.check(), h.sup.check()]);
+  assert.equal(h.connects(), 1);
+});
+
+test("A failing reconnect keeps watching instead of giving up", async () => {
+  // The usual cause is a leader restart, so the next check is the recovery.
+  const h = supervisorHarness({ connectSucceeds: false });
+  h.sup.start();
+  h.setConnected(false);
+
+  for (let i = 0; i < 3; i += 1) await h.sup.check();
+  assert.equal(h.connects(), 3, "it keeps trying");
+  // Reported on a widening scale, not once a minute forever.
+  assert.equal(
+    h.phases.filter((p) => p === "reconnect-failing").length,
+    1,
+    "only the first failure in the series is reported",
+  );
+});
+
+test("A disabled bridge is never reconnected", async () => {
+  const h = supervisorHarness({ enabled: false });
+  h.sup.start();
+  h.setConnected(false);
+  await h.sup.check();
+  assert.equal(h.connects(), 0);
+});
+
+test("The watch timer reschedules itself after each check", async () => {
+  const h = supervisorHarness();
+  h.sup.start();
+  assert.ok(h.armed());
+  h.setConnected(false);
+  await h.tick();
+  assert.equal(h.connects(), 1);
+  assert.ok(h.armed(), "a check must arm the next one, or watching stops");
+});
 
 function input(
   overrides: Partial<TelegramAutoConnectInput> = {},
