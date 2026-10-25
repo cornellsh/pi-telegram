@@ -11,6 +11,7 @@ import {
   planTelegramAutoConnect,
   runTelegramAutoConnect,
   TELEGRAM_AUTO_CONNECT_BACKOFF_MS,
+  TELEGRAM_AUTO_CONNECT_MAX_BACKOFF_MS,
   type TelegramAutoConnectInput,
 } from "../lib/auto-connect.ts";
 
@@ -25,6 +26,7 @@ function supervisorHarness(
   let connects = 0;
   const phases: string[] = [];
   let fire: (() => void) | undefined;
+  const delays: number[] = [];
   const deps = {
     isAutoConnectEnabled: () => options.enabled ?? true,
     hasBotToken: () => true,
@@ -38,8 +40,9 @@ function supervisorHarness(
     },
     sleep: async () => {},
     backoffMs: [0] as readonly number[],
-    setTimer: (fn: () => void) => {
+    setTimer: (fn: () => void, ms: number) => {
       fire = fn;
+      delays.push(ms);
       return { unref() {} };
     },
     clearTimer: () => {
@@ -56,6 +59,7 @@ function supervisorHarness(
     },
     isConnected: () => connected,
     armed: () => fire !== undefined,
+    delays,
     tick: async () => {
       const f = fire;
       fire = undefined;
@@ -129,6 +133,46 @@ test("A failing reconnect keeps watching instead of giving up", async () => {
     1,
     "only the first failure in the series is reported",
   );
+});
+
+test("Repeated reconnect failures back off instead of retrying every minute", async () => {
+  // Two machines on one bot token conflict permanently, so the binding dies
+  // seconds after each reconnect. At a flat interval that produced a connect
+  // notice every minute for hours, which reads as the bridge malfunctioning
+  // rather than as one external cause.
+  const h = supervisorHarness({ connectSucceeds: false });
+  h.sup.start();
+  h.setConnected(false);
+  for (let i = 0; i < 5; i += 1) await h.tick();
+
+  const gaps = h.delays;
+  assert.ok(gaps.length >= 5, `expected several scheduled waits, got ${gaps}`);
+  for (let i = 1; i < gaps.length; i += 1) {
+    assert.ok(
+      gaps[i]! >= gaps[i - 1]!,
+      `gap must never shrink while failing: ${gaps}`,
+    );
+  }
+  assert.ok(gaps.at(-1)! > gaps[0]!, `gap must widen: ${gaps}`);
+  assert.ok(
+    gaps.every((g) => g <= TELEGRAM_AUTO_CONNECT_MAX_BACKOFF_MS),
+    `gap must stay capped: ${gaps}`,
+  );
+});
+
+test("A recovered binding returns the watch to its normal cadence", async () => {
+  const h = supervisorHarness({ connectSucceeds: false });
+  h.sup.start();
+  h.setConnected(false);
+  for (let i = 0; i < 3; i += 1) await h.tick();
+  const widened = h.delays.at(-1)!;
+  assert.ok(widened > h.delays[0]!);
+
+  // Binding comes back, so the next wait is the base interval again rather
+  // than leaving a healthy bridge checked once a quarter of an hour.
+  h.setConnected(true);
+  await h.tick();
+  assert.equal(h.delays.at(-1), h.delays[0]);
 });
 
 test("A disabled bridge is never reconnected", async () => {

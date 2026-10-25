@@ -196,6 +196,19 @@ export function createTelegramConnectCommandHolder(): TelegramConnectCommandHold
  */
 export const TELEGRAM_AUTO_CONNECT_WATCH_MS = 60_000;
 
+/**
+ * Ceiling for the widening gap between failed reconnects.
+ *
+ * A fixed interval is wrong when the cause is not going away. Two machines
+ * polling the same bot token conflict permanently, so the binding is lost
+ * again within seconds of every reconnect; at a flat minute that produced a
+ * reconnect, a promotion and a connect notice every single minute for hours,
+ * which read as the bridge malfunctioning rather than as one external cause.
+ * Backing off keeps recovery quick when the fault is transient and quiet when
+ * it is not.
+ */
+export const TELEGRAM_AUTO_CONNECT_MAX_BACKOFF_MS = 15 * 60_000;
+
 export interface TelegramAutoConnectSupervisorDeps
   extends TelegramAutoConnectSessionRuntimeDeps {
   setTimer: (fn: () => void, ms: number) => unknown;
@@ -231,12 +244,20 @@ export function createTelegramAutoConnectSupervisor<TContext>(
   let suspended = false;
   let consecutiveFailures = 0;
 
+  // Doubles per consecutive failure, capped, and resets the moment a binding
+  // comes back.
+  const nextDelay = (): number =>
+    Math.min(
+      intervalMs * 2 ** Math.min(consecutiveFailures, 10),
+      TELEGRAM_AUTO_CONNECT_MAX_BACKOFF_MS,
+    );
+
   const schedule = (): void => {
     if (suspended || handle !== undefined) return;
     handle = deps.setTimer(() => {
       handle = undefined;
       void check().finally(schedule);
-    }, intervalMs);
+    }, nextDelay());
     (handle as { unref?: () => void })?.unref?.();
   };
 
