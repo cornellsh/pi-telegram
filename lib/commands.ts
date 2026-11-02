@@ -44,6 +44,64 @@ export interface TelegramExtensionCommandContext {
   enqueuePrompt: (prompt: string) => Promise<void>;
 }
 
+// --- extension callbacks ----------------------------------------------------
+// Inline-keyboard buttons that an extension sends itself (outside a model
+// reply) carry callback_data `<prefix>:<payload>`. Their presses arrive here
+// and run the extension's handler directly: no model turn, no prompt.
+
+const TELEGRAM_EXTENSION_CALLBACK_REGISTRY_KEY = "__piTelegramCallbackRegistry__";
+const TELEGRAM_EXTENSION_CALLBACK_PREFIX_PATTERN = /^[a-z][a-z0-9_-]{1,15}$/;
+
+export interface TelegramExtensionCallbackContext {
+  data: string;
+  payload: string;
+  fromUserId: number;
+  chatId: number;
+  messageId: number;
+  threadId?: number;
+  /** Toast shown to the user; call once. */
+  answer: (text?: string) => Promise<void>;
+  editReplyMarkup: (markup: { inline_keyboard: unknown[][] }) => Promise<void>;
+}
+
+export interface TelegramExtensionCallbackRegistration {
+  prefix: string;
+  handler: (ctx: TelegramExtensionCallbackContext) => Promise<void> | void;
+}
+
+function getTelegramCallbackRegistry(): Map<string, TelegramExtensionCallbackRegistration["handler"]> {
+  const g = globalThis as Record<string, unknown>;
+  const existing = g[TELEGRAM_EXTENSION_CALLBACK_REGISTRY_KEY];
+  if (existing instanceof Map) return existing as Map<string, TelegramExtensionCallbackRegistration["handler"]>;
+  const created = new Map<string, TelegramExtensionCallbackRegistration["handler"]>();
+  g[TELEGRAM_EXTENSION_CALLBACK_REGISTRY_KEY] = created;
+  return created;
+}
+
+export function registerTelegramCallbackHandler(registration: TelegramExtensionCallbackRegistration): () => void {
+  const prefix = registration.prefix;
+  if (!TELEGRAM_EXTENSION_CALLBACK_PREFIX_PATTERN.test(prefix)) {
+    throw new Error(`Invalid Telegram callback prefix: ${prefix}`);
+  }
+  if (prefix === "tgbtn" || prefix === "compact") {
+    throw new Error(`Telegram callback prefix is reserved: ${prefix}`);
+  }
+  const registry = getTelegramCallbackRegistry();
+  registry.set(prefix, registration.handler);
+  return () => {
+    if (registry.get(prefix) === registration.handler) registry.delete(prefix);
+  };
+}
+
+export function findTelegramCallbackHandler(
+  data: string | undefined,
+): { handler: TelegramExtensionCallbackRegistration["handler"]; payload: string } | undefined {
+  const i = data?.indexOf(":") ?? -1;
+  if (!data || i < 1) return undefined;
+  const handler = getTelegramCallbackRegistry().get(data.slice(0, i));
+  return handler ? { handler, payload: data.slice(i + 1) } : undefined;
+}
+
 export interface TelegramExtensionCommandRegistration {
   name: string;
   description?: string;

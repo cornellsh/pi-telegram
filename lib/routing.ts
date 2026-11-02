@@ -1795,6 +1795,43 @@ export function createTelegramInboundRouteRuntime<
     assertExecutionCurrent();
     if (await handleUnboundRerouteRestoreMenuCallback(query, ctx)) return;
     if (await handleUnboundRerouteCallback(query, ctx)) return;
+    const extensionCallback = Commands.findTelegramCallbackHandler(query.data);
+    const extChatId = query.message?.chat?.id;
+    const extMessageId = query.message?.message_id;
+    if (extensionCallback && typeof extChatId === "number" && typeof extMessageId === "number") {
+      let answered = false;
+      const answer = async (text?: string) => {
+        if (answered) return;
+        answered = true;
+        await deps.answerCallbackQuery(query.id, text);
+      };
+      try {
+        await extensionCallback.handler({
+          data: query.data ?? "",
+          payload: extensionCallback.payload,
+          fromUserId: query.from.id,
+          chatId: extChatId,
+          messageId: extMessageId,
+          ...(typeof query.message?.message_thread_id === "number"
+            ? { threadId: query.message.message_thread_id }
+            : {}),
+          answer,
+          editReplyMarkup: async (markup) => {
+            await deps.editMessageReplyMarkup?.(
+              extChatId,
+              extMessageId,
+              markup as Parameters<NonNullable<typeof deps.editMessageReplyMarkup>>[2],
+            );
+          },
+        });
+      } catch (error) {
+        deps.recordRuntimeEvent?.("telegram", error, { phase: "extension-callback", data: query.data });
+        await answer("Action failed.");
+        return;
+      }
+      await answer();
+      return;
+    }
     if (deps.buttonActionStore) {
       const handled = await OutboundHandlers.handleTelegramButtonCallbackQuery(
         query,
