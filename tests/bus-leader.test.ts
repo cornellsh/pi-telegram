@@ -2954,3 +2954,95 @@ test("Bus leader runtime stops the local server if polling startup fails", async
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --- live collision: provisioning and notice rate limit ---
+
+function provisioner(store: ReturnType<typeof createTelegramTopicTargetStore>, live: Set<string>, calls: { method: string; body: Record<string, unknown> }[], now: { ms: number }) {
+  let thread = 100;
+  let syncState = {};
+  return createTelegramBusFollowerTargetProvisioner({
+    getAllowedUserId: () => 7,
+    topicTargetStore: store,
+    isFollowerLive: (id) => live.has(id),
+    async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+      calls.push({ method, body });
+      if (method === "createForumTopic") return { message_thread_id: ++thread } as TResponse;
+      return { ok: true } as TResponse;
+    },
+    getNowMs: () => now.ms,
+    getSyncState: () => syncState,
+    setSyncState: (s) => {
+      syncState = s;
+    },
+    recordRuntimeEvent() {},
+  });
+}
+
+function seed(store: ReturnType<typeof createTelegramTopicTargetStore>, instanceId: string) {
+  store.upsert({
+    profileKey: "manual:shared",
+    owner: { kind: "manual-follower", instanceId: "shared" },
+    target: { chatId: 7, threadId: 42 },
+    status: "active",
+    createdAtMs: 900,
+    updatedAtMs: 950,
+    instanceId,
+    slot: "R",
+    threadName: "Router",
+  });
+}
+
+test("a second live session under the same key gets its own topic and leaves the first alone", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-live-collision-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  seed(store, "router-instance");
+  const calls: { method: string; body: Record<string, unknown> }[] = [];
+  try {
+    const provision = provisioner(store, new Set(["router-instance"]), calls, { ms: 1001 });
+    const got = await provision({ instanceId: "newcomer", profileKey: "manual:shared", connectedAtMs: 1001 });
+    assert.notEqual(got?.threadId, 42, "the live router's topic is not handed over");
+    assert.ok(calls.some((c) => c.method === "createForumTopic"), "a fresh topic is created");
+    assert.ok(!calls.some((c) => c.body.message_thread_id === 42), "nothing is posted into the router's topic");
+    const router = store.list().find((r) => r.target.threadId === 42);
+    assert.equal(router?.instanceId, "router-instance");
+    const mine = store.list().find((r) => r.target.threadId === got?.threadId);
+    assert.equal(mine?.profileKey, "manual:shared#newcomer");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a dead holder's topic is still handed to the restarted session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-dead-holder-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  seed(store, "old-instance");
+  const calls: { method: string; body: Record<string, unknown> }[] = [];
+  try {
+    const provision = provisioner(store, new Set(), calls, { ms: 1001 });
+    const got = await provision({ instanceId: "restarted", profileKey: "manual:shared", connectedAtMs: 1001 });
+    assert.equal(got?.threadId, 42);
+    assert.ok(!calls.some((c) => c.method === "createForumTopic"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the connected notice is posted at most once a minute per topic; later probes are invisible", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-notice-rate-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  seed(store, "a");
+  const calls: { method: string; body: Record<string, unknown> }[] = [];
+  const now = { ms: 10_000 };
+  try {
+    const provision = provisioner(store, new Set(), calls, now);
+    await provision({ instanceId: "b", profileKey: "manual:shared", connectedAtMs: now.ms });
+    now.ms += 2_000;
+    await provision({ instanceId: "c", profileKey: "manual:shared", connectedAtMs: now.ms });
+    now.ms += 61_000;
+    await provision({ instanceId: "d", profileKey: "manual:shared", connectedAtMs: now.ms });
+    const into42 = calls.filter((c) => c.body.message_thread_id === 42).map((c) => c.method);
+    assert.deepEqual(into42, ["sendMessage", "sendChatAction", "sendMessage"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

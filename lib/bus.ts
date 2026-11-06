@@ -152,6 +152,33 @@ export function getTelegramProcessLiveness(
   return proof.identity === owner.processBirthId ? "alive" : "dead";
 }
 
+/**
+ * The terminal slot a session lives in, when that is a tmux pane.
+ *
+ * The manual-follower owner identity decides which topic a session gets back
+ * after a restart. It was the parent process, meant to be the shell in the
+ * pane. A pi started directly as a tmux window command (`tmux new-window pi`)
+ * has the tmux SERVER as its parent, shared by every such window, so unrelated
+ * sessions looked like one session restarting: they handed one topic back and
+ * forth, evicting each other and posting "connected" on every swap.
+ *
+ * `$TMUX_PANE` is unique per pane for the server's lifetime and survives a pi
+ * restart in that pane, which is exactly the slot semantics wanted. The server's
+ * birth identity scopes it, because pane ids restart from %0 with a new server.
+ */
+export function getTelegramTmuxPaneOwnerIdentity(
+  env: Record<string, string | undefined> = process.env,
+  options: TelegramProcessBirthIdentityOptions = {},
+): string | undefined {
+  const pane = env.TMUX_PANE;
+  if (!pane || !/^%\d+$/u.test(pane)) return undefined;
+  const serverPid = Number(env.TMUX?.split(",")[1]);
+  if (!Number.isInteger(serverPid) || serverPid <= 0) return undefined;
+  const server = getTelegramProcessBirthProof(serverPid, options);
+  if (server.status !== "proven") return undefined;
+  return `${server.identity}:pane:${pane}`;
+}
+
 export function createCurrentTelegramBusProcessRuntime(input: {
   getActiveProfileName: () => string | undefined;
   pid?: number;
@@ -162,6 +189,10 @@ export function createCurrentTelegramBusProcessRuntime(input: {
     getActiveProfileName: input.getActiveProfileName,
     pid: input.pid ?? process.pid,
     parentPid: input.parentPid ?? process.ppid,
+    // An explicit parent is a caller's deliberate choice; only the real
+    // process environment is consulted for the tmux pane.
+    parentProcessIdentity:
+      input.parentPid === undefined ? getTelegramTmuxPaneOwnerIdentity() : undefined,
     createdAtMs: input.createdAtMs ?? Date.now(),
   });
 }
@@ -174,7 +205,8 @@ export function createTelegramBusProcessRuntime(input: {
   createdAtMs: number;
 }): TelegramBusProcessRuntime {
   const instanceId = `${input.pid}:${input.createdAtMs}`;
-  const ownerPid = input.parentPid || input.pid;
+  // pid 1 (launchd/init) parents every orphan and daemon: never a session slot.
+  const ownerPid = input.parentPid && input.parentPid !== 1 ? input.parentPid : input.pid;
   const manualFollowerOwnerId =
     input.parentProcessIdentity ??
     getTelegramProcessBirthIdentity(ownerPid, input.createdAtMs);
@@ -1911,6 +1943,13 @@ export interface TelegramBusFollowerRegistry {
   ) => TelegramBusFollowerView[];
 }
 
+/**
+ * A follower heartbeats every second and the leader prunes it after 5 s of
+ * silence; inside this window it is a live session that must not be evicted
+ * by another registration that merely shares its profile key.
+ */
+export const TELEGRAM_BUS_FOLLOWER_LIVE_WINDOW_MS = 4000;
+
 export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry {
   const followers = new Map<string, TelegramBusFollowerView>();
   const clone = (
@@ -1939,7 +1978,14 @@ export function createTelegramBusFollowerRegistry(): TelegramBusFollowerRegistry
           registration.target !== undefined &&
           follower.target?.chatId === registration.target.chatId &&
           follower.target.threadId === registration.target.threadId;
-        if (sameProfile || sameTarget) followers.delete(instanceId);
+        // One owner per topic, always. A shared profile key alone is a restart
+        // only when the old holder has gone quiet; a holder still heartbeating
+        // is a different live session, and evicting it started an endless
+        // evict/re-register loop between the two.
+        const holderLive =
+          registration.connectedAtMs - follower.lastHeartbeatMs <=
+          TELEGRAM_BUS_FOLLOWER_LIVE_WINDOW_MS;
+        if (sameTarget || (sameProfile && !holderLive)) followers.delete(instanceId);
       }
       const next: TelegramBusFollowerView = {
         ...registration,

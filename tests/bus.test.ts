@@ -55,6 +55,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
 } from "../lib/bus.ts";
+import { getTelegramTmuxPaneOwnerIdentity } from "../lib/bus.ts";
 
 test("Bus envelope auth compares the exact secret in constant time", () => {
   const secret = "leader-minted-secret";
@@ -2503,3 +2504,61 @@ test("Bus follower registry returns defensive copies", () => {
     threadId: 2,
   });
 });
+
+// --- live collision: identity and registry ---
+
+const darwin = (startedAt: string | undefined) => ({
+  platform: "darwin" as const,
+  readDarwinProcessStart: (): string => {
+    // An unreadable start time throws, exactly as the real reader does.
+    if (startedAt === undefined) throw new Error("no start time");
+    return startedAt;
+  },
+});
+
+test("tmux pane identity is scoped by server birth and stable per pane", () => {
+  const env = { TMUX: "/private/tmp/tmux-501/default,1250,0", TMUX_PANE: "%41" };
+  const a = getTelegramTmuxPaneOwnerIdentity(env, darwin("Mon Nov  3 10:00:00 2026"));
+  const b = getTelegramTmuxPaneOwnerIdentity(env, darwin("Mon Nov  3 10:00:00 2026"));
+  const otherPane = getTelegramTmuxPaneOwnerIdentity({ ...env, TMUX_PANE: "%42" }, darwin("Mon Nov  3 10:00:00 2026"));
+  const newServer = getTelegramTmuxPaneOwnerIdentity(env, darwin("Tue Nov  4 09:00:00 2026"));
+  assert.ok(a?.startsWith("1250:start:") && a.endsWith(":pane:%41"));
+  assert.equal(a, b, "a pi restart in the same pane keeps its identity");
+  assert.notEqual(a, otherPane, "two panes never share an identity");
+  assert.notEqual(a, newServer, "pane ids restart with a new server, so the server scopes them");
+});
+
+test("tmux pane identity is absent outside tmux and when unprovable", () => {
+  const proven = darwin("Mon Nov  3 10:00:00 2026");
+  assert.equal(getTelegramTmuxPaneOwnerIdentity({}, proven), undefined);
+  assert.equal(getTelegramTmuxPaneOwnerIdentity({ TMUX_PANE: "%1" }, proven), undefined);
+  assert.equal(getTelegramTmuxPaneOwnerIdentity({ TMUX: "/s,1250,0", TMUX_PANE: "41" }, proven), undefined);
+  assert.equal(getTelegramTmuxPaneOwnerIdentity({ TMUX: "/s,abc,0", TMUX_PANE: "%1" }, proven), undefined);
+  assert.equal(getTelegramTmuxPaneOwnerIdentity({ TMUX: "/s,1250,0", TMUX_PANE: "%1" }, darwin(undefined)), undefined);
+});
+
+test("a session parented by pid 1 owns its slot by its own pid", () => {
+  const runtime = createTelegramBusProcessRuntime({
+    getActiveProfileName: () => undefined,
+    pid: 4242,
+    parentPid: 1,
+    createdAtMs: 1000,
+  });
+  assert.match(runtime.manualFollowerOwnerId, /^4242:/);
+});
+
+test("registry never evicts a live holder over a shared profile key, only over the same topic", () => {
+  const registry = createTelegramBusFollowerRegistry();
+  registry.register({ instanceId: "router", profileKey: "manual:x", target: { chatId: 7, threadId: 42 }, connectedAtMs: 1000 });
+  registry.heartbeat("router", 5000);
+  registry.register({ instanceId: "newcomer", profileKey: "manual:x", target: { chatId: 7, threadId: 43 }, connectedAtMs: 5500 });
+  assert.ok(registry.get("router"), "a live holder under the same key stays");
+  assert.ok(registry.get("newcomer"));
+
+  registry.register({ instanceId: "thief", profileKey: "manual:y", target: { chatId: 7, threadId: 43 }, connectedAtMs: 5600 });
+  assert.equal(registry.get("newcomer"), undefined, "one owner per topic, always");
+
+  registry.register({ instanceId: "restart", profileKey: "manual:x", target: { chatId: 7, threadId: 44 }, connectedAtMs: 20_000 });
+  assert.equal(registry.get("router"), undefined, "a silent holder under the same key is a restart and goes");
+});
+

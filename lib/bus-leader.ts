@@ -32,6 +32,7 @@ import {
   type TelegramBusSocketPathSource,
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
+  TELEGRAM_BUS_FOLLOWER_LIVE_WINDOW_MS,
 } from "./bus.ts";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 import type { TelegramQueueHandoffPayload } from "./queue.ts";
@@ -113,6 +114,12 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
 }
 
 export interface TelegramBusFollowerTargetProvisionerDeps {
+  /**
+   * True while another registered follower is still heartbeating. A topic it
+   * holds is never handed to a different registration, even one sharing its
+   * profile key: that is a second live session, not a restart.
+   */
+  isFollowerLive?: (instanceId: string) => boolean;
   getAllowedUserId: () => number | undefined;
   topicTargetStore: Threads.TelegramTopicTargetStore;
   callApi: <TResponse>(
@@ -245,6 +252,10 @@ export function createTelegramBusLeaderRuntimeAssembly<TContext>(
     }),
     provisionFollowerTarget: createTelegramBusFollowerTargetProvisioner({
       ...provisionerPorts,
+      isFollowerLive: (instanceId) => {
+        const follower = deps.runtime.followerRegistry.get(instanceId);
+        return !!follower && Date.now() - follower.lastHeartbeatMs <= TELEGRAM_BUS_FOLLOWER_LIVE_WINDOW_MS;
+      },
     }),
     getCurrentLeaderEpoch: deps.getCurrentLeaderEpoch,
     callApi: createTelegramBusLeaderApiProxy({
@@ -342,6 +353,7 @@ export function createTelegramBusInstanceLifecycleAnnouncement(input: {
 }
 
 const TELEGRAM_BUS_SLOW_FOLLOWER_REGISTRATION_MS = 1000;
+const TELEGRAM_BUS_ANNOUNCEMENT_MIN_INTERVAL_MS = 60_000;
 
 function scheduleTelegramBusLeaderBackgroundTask(
   task: () => Promise<void>,
@@ -392,6 +404,7 @@ export function createTelegramBusFollowerTargetProvisioner(
   (TelegramTarget & { slot?: string; threadName?: string }) | undefined
 > {
   const getNowMs = deps.getNowMs ?? Date.now;
+  const recentAnnouncements = new Map<string, number>();
   const pendingRegistrations = new Map<
     string,
     Promise<
@@ -416,10 +429,32 @@ export function createTelegramBusFollowerTargetProvisioner(
       claimPendingTargets: false,
     });
     const recordsBeforeProvision = deps.topicTargetStore.list();
-    const followerProfileKey =
+    const followerProfileKeyBase =
       registration.profileKey ?? `manual:${registration.instanceId}`;
     const requestedTarget = registration.target;
+    const heldByOtherLiveSession = (record: Threads.TelegramTopicTargetRecord) =>
+      !!record.instanceId &&
+      record.instanceId !== registration.instanceId &&
+      record.instanceId !== registration.previousInstanceId &&
+      deps.isFollowerLive?.(record.instanceId) === true;
+    const liveCollision = recordsBeforeProvision.some(
+      (record) =>
+        record.profileKey === followerProfileKeyBase && heldByOtherLiveSession(record),
+    );
+    // A second live session under the same key gets its own key, so its fresh
+    // topic never reconnects to, or is reconnected by, the first session's.
+    const followerProfileKey = liveCollision
+      ? `${followerProfileKeyBase}#${registration.instanceId}`
+      : followerProfileKeyBase;
+    if (liveCollision) {
+      deps.recordRuntimeEvent("bus", "Telegram follower profile key held by another live session; provisioning a separate topic", {
+        phase: "follower-register-live-collision",
+        instanceId: registration.instanceId,
+        profileKey: followerProfileKeyBase,
+      });
+    }
     const reconnectRecord = recordsBeforeProvision.find((record) => {
+      if (heldByOtherLiveSession(record)) return false;
       const matchesRequestedTarget =
         !requestedTarget ||
         (record.target.chatId === requestedTarget.chatId &&
@@ -583,10 +618,19 @@ export function createTelegramBusFollowerTargetProvisioner(
             })
           : undefined;
       if (requiresVisibilityProbe && connectedAnnouncement) {
+        // The probe must reach the topic to prove it still exists, but a
+        // visible "connected" line more than once a minute per topic is noise:
+        // a re-registration loop once posted dozens per minute. A typing
+        // action probes the topic just as well, invisibly.
+        const announceKey = `${connectedAnnouncement.target.chatId}:${connectedAnnouncement.target.threadId}`;
+        const lastAnnounced = recentAnnouncements.get(announceKey);
+        const quietProbe =
+          exactSessionHandoff ||
+          (lastAnnounced !== undefined && getNowMs() - lastAnnounced < TELEGRAM_BUS_ANNOUNCEMENT_MIN_INTERVAL_MS);
         try {
           await deps.callApi(
-            exactSessionHandoff ? "sendChatAction" : "sendMessage",
-            exactSessionHandoff
+            quietProbe ? "sendChatAction" : "sendMessage",
+            quietProbe
               ? {
                   chat_id: connectedAnnouncement.target.chatId,
                   message_thread_id: connectedAnnouncement.target.threadId,
@@ -599,6 +643,9 @@ export function createTelegramBusFollowerTargetProvisioner(
                   parse_mode: connectedAnnouncement.parseMode,
                 },
           );
+          // Counted only once delivered: a failed or ambiguous send may never
+          // have been seen, so the retry must still be visible.
+          if (!quietProbe) recentAnnouncements.set(announceKey, getNowMs());
           if (recoverableTarget || probeRequiredRecord) {
             const activatedRecord = deps.topicTargetStore.upsert({
               ...result.record,
