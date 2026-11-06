@@ -11,6 +11,7 @@ import type {
 } from "./bus.ts";
 import type { TelegramRoutedMessage } from "./routing.ts";
 import type { TelegramTarget } from "./target.ts";
+import * as Threads from "./threads.ts";
 import { TELEGRAM_INTERNAL_AGENT_MESSAGE } from "./updates.ts";
 
 export interface TelegramAgentMessageRuntimeDeps<TContext, TUpdate> {
@@ -67,10 +68,13 @@ export function createTelegramAgentMessageRuntime<TContext, TUpdate>(
         return candidate.target.threadId === selector.threadId;
       }
       const requestedName = selector.threadName?.trim().toLocaleLowerCase();
+      if (requestedName === undefined || requestedName.length === 0) return false;
+      // The topic's display name is what turn labels show the model, so it is
+      // what the model will ask for; the palette name keeps working too.
+      const displayName = Threads.readTelegramTopicDisplayName(candidate.target.threadId);
       return (
-        requestedName !== undefined &&
-        requestedName.length > 0 &&
-        candidate.threadName?.trim().toLocaleLowerCase() === requestedName
+        candidate.threadName?.trim().toLocaleLowerCase() === requestedName ||
+        displayName?.toLocaleLowerCase() === requestedName
       );
     });
     if (matches.length !== 1) return undefined;

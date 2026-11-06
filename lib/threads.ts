@@ -10,6 +10,7 @@ import {
   existsSync,
   readFileSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -34,7 +35,43 @@ import * as ThreadReconciler from "./thread-reconciler.ts";
 import {
   resolveAgentDir,
   resolveTelegramProfileTempFilePath,
+  resolveTelegramTopicDisplayNamesPath,
 } from "./paths.ts";
+
+const TELEGRAM_TOPIC_DISPLAY_NAME_MAX = 64;
+let topicDisplayNamesCache: { path: string; mtimeMs: number; names: Record<string, string> } | undefined;
+
+/**
+ * The name the operator sees on a topic, when an external renamer recorded it.
+ *
+ * Display only: it labels Telegram-originated turns so the model and the TUI
+ * use the same name as the Telegram tab. It never feeds slot, restore or
+ * ownership logic, which keep the bridge's own palette names. Read through an
+ * mtime cache, so a label lookup costs one stat. Any malformed file, entry or
+ * name answers undefined and the palette name is used.
+ */
+export function readTelegramTopicDisplayName(
+  threadId: number,
+  path: string = resolveTelegramTopicDisplayNamesPath(),
+): string | undefined {
+  try {
+    const mtimeMs = statSync(path).mtimeMs;
+    if (topicDisplayNamesCache?.path !== path || topicDisplayNamesCache.mtimeMs !== mtimeMs) {
+      const parsed: unknown = JSON.parse(readFileSync(path, "utf8"));
+      const names: Record<string, string> = {};
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        for (const [key, value] of Object.entries(parsed)) {
+          if (/^\d+$/u.test(key) && typeof value === "string") names[key] = value;
+        }
+      }
+      topicDisplayNamesCache = { path, mtimeMs, names };
+    }
+    const name = topicDisplayNamesCache.names[String(threadId)]?.trim();
+    return name && name.length <= TELEGRAM_TOPIC_DISPLAY_NAME_MAX && !/[\r\n\]]/u.test(name) ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export interface TelegramThreadNameInput {
   seed: string;

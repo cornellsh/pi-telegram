@@ -53,6 +53,15 @@ export function resolveTelegramTempDir(agentDir = resolveAgentDir()): string {
   return join(agentDir, "tmp", "telegram");
 }
 
+/**
+ * Topic display names written by an external renamer (<agentDir>/tmp/telegram/thread-names.json),
+ * `{ "<threadId>": "<name>" }`. A bot never receives an update for its own topic
+ * rename, so this file is how the bridge learns the name the operator sees.
+ */
+export function resolveTelegramTopicDisplayNamesPath(): string {
+  return join(resolveTelegramTempDir(), "thread-names.json");
+}
+
 /** Telegram transport ownership store (<agentDir>/tmp/telegram/owners.json). */
 export function resolveTelegramOwnersPath(): string {
   return join(resolveTelegramTempDir(), "owners.json");

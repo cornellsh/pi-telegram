@@ -785,6 +785,10 @@ export function createTelegramInboundRouteRuntime<
     const chatId = message.chat.id;
     const threadId = message.message_thread_id;
     if (!threadId) return undefined;
+    // The name on the Telegram tab wins, so the model, the TUI and the operator
+    // all say the same thing; palette names remain the fallback.
+    const displayName = Threads.readTelegramTopicDisplayName(threadId);
+    if (displayName) return displayName;
     const localLabel = deps.getLocalThreadLabelForTarget?.({ chatId, threadId });
     if (localLabel) return localLabel;
     if (!deps.threadStore) return undefined;

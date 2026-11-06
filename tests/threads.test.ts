@@ -9,6 +9,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { readTelegramTopicDisplayName } from "../lib/threads.ts";
 
 import {
   chooseTelegramThreadName,
@@ -3280,3 +3282,29 @@ test("Thread store persists only current state statuses", async () => {
     await rm(dir, { force: true, recursive: true });
   }
 });
+
+// --- topic display names ---
+
+test("topic display names come from the renamer's file and refresh when it changes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-topic-names-"));
+  const file = join(dir, "thread-names.json");
+  try {
+    writeFileSync(file, JSON.stringify({ "203617": "terminal1", "42": " pad ", "7": "x]y", "8": "a".repeat(65), "bad": "z", "9": 5 }));
+    assert.equal(readTelegramTopicDisplayName(203617, file), "terminal1");
+    assert.equal(readTelegramTopicDisplayName(42, file), "pad", "names are trimmed");
+    assert.equal(readTelegramTopicDisplayName(7, file), undefined, "a ']' would break the turn prefix");
+    assert.equal(readTelegramTopicDisplayName(8, file), undefined, "over-long names are ignored");
+    assert.equal(readTelegramTopicDisplayName(9, file), undefined, "non-string values are ignored");
+    assert.equal(readTelegramTopicDisplayName(1, file), undefined);
+    writeFileSync(file, JSON.stringify({ "203617": "terminal2" }));
+    utimesSync(file, new Date(), new Date(Date.now() + 5_000));
+    assert.equal(readTelegramTopicDisplayName(203617, file), "terminal2", "a rewrite is picked up");
+    writeFileSync(file, "{not json");
+    utimesSync(file, new Date(), new Date(Date.now() + 10_000));
+    assert.equal(readTelegramTopicDisplayName(203617, file), undefined, "a corrupt file falls back to palette names");
+    assert.equal(readTelegramTopicDisplayName(203617, join(dir, "missing.json")), undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+

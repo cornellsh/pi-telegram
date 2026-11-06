@@ -6,6 +6,9 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createTelegramAgentMessageRuntime } from "../lib/agent-messages.ts";
 import { createTelegramBusFollowerRegistry } from "../lib/bus.ts";
@@ -95,3 +98,31 @@ test("Agent message runtime rejects unknown, ambiguous, and cross-chat targets",
     undefined,
   );
 });
+
+test("Agent message target resolves a live thread by its topic display name", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-agent-display-"));
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = dir;
+  mkdirSync(join(dir, "tmp", "telegram"), { recursive: true });
+  writeFileSync(join(dir, "tmp", "telegram", "thread-names.json"), JSON.stringify({ "99": "terminal1" }));
+  try {
+    const registry = createTelegramBusFollowerRegistry();
+    registry.register({ instanceId: "hazel", threadName: "Hazel", target: { chatId: 7, threadId: 99 }, connectedAtMs: 1 });
+    const runtime = createTelegramAgentMessageRuntime({
+      instanceId: "isle",
+      getAllowedChatId: () => 7,
+      getLeaderTarget: () => ({ chatId: 7, threadId: 42 }),
+      getLeaderThreadName: () => "Isle",
+      followerRegistry: registry,
+      getContext: () => undefined,
+      handleUpdate: async () => {},
+    });
+    assert.deepEqual(runtime.resolveTarget({ threadName: "Terminal1" }, { chatId: 7, threadId: 42 }), { chatId: 7, threadId: 99 });
+    assert.deepEqual(runtime.resolveTarget({ threadName: "hazel" }, { chatId: 7, threadId: 42 }), { chatId: 7, threadId: 99 }, "palette names still work");
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
