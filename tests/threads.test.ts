@@ -3308,3 +3308,11 @@ test("topic display names come from the renamer's file and refresh when it chang
   }
 });
 
+test("topic names never keep an unreplaced {slot} placeholder", () => {
+  const request = { instanceId: "i", profileKey: "manual:x", owner: { kind: "manual-follower" as const, instanceId: "x" } };
+  assert.equal(getTelegramTopicName(request, "{slot}", undefined), "Pi", "slots exhausted: a neutral name, never the literal placeholder");
+  assert.equal(getTelegramTopicName(request, "{slot}", "R"), "R");
+  assert.equal(getTelegramTopicName(request, "pi {slot}", undefined), "pi");
+  assert.equal(getTelegramTopicName({ ...request, threadName: "router" }, "{threadName}", undefined), "router");
+});
+

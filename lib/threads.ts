@@ -2107,12 +2107,14 @@ function applyTopicNameTemplate(
 ): string {
   const threadName =
     request.threadName?.replace(/\s+/g, " ").trim() || request.profileKey;
-  let result = template
+  // Every placeholder is replaced, an unavailable slot by nothing: with all
+  // slot letters taken, `{slot}` used to survive verbatim and become a topic
+  // literally named "{slot}". An empty result falls back in getTelegramTopicName.
+  return template
     .replaceAll("{threadName}", threadName)
     .replaceAll("{profileKey}", request.profileKey)
-    .replaceAll("{instanceId}", request.instanceId);
-  if (slot) result = result.replaceAll("{slot}", slot);
-  return result;
+    .replaceAll("{instanceId}", request.instanceId)
+    .replaceAll("{slot}", slot ?? "");
 }
 
 export function getTelegramTopicName(
