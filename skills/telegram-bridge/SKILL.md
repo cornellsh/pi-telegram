@@ -38,18 +38,7 @@ Treat the complete turn as one request. Do not infer another target, sender, or 
 
 Reply in concise, phone-width Telegram Rich Markdown. Use `$...$` and `$$...$$` for math, keep code blocks literal, and never expose hidden reasoning, tool arguments, secrets, or private bridge state.
 
-The reader is on a phone, scanning. Format for that channel:
-
-- Lead with the answer on the first line. No preamble.
-- One idea per message. For a multi-part reply, send several short messages rather than one long block.
-- Put a blank line between paragraphs so they render as separate paragraphs.
-- Keep paragraphs to a few short lines. Prefer lists for parallel items; do not nest past two levels.
-- Do not use tables. Telegram has no table layout; render the same data as a short list or a sequence.
-- Do not use headings; Telegram has no heading style. Use a bold lead phrase instead.
-- Use bold only for the single most important term in a message. Use `code` for commands, paths, and filenames.
-- Write standard technical English. Do not substitute symbols or arrows for words like "then" or "therefore".
-- Write in a conversational register, like texting a colleague. Plain sentences, subject-verb-object. Avoid em-dash constructions, colon-fronted fragments, appositives, and compressed noun phrases. Never narrate your own message ("proof attached", "see above").
-- Reserve emoji for status where it earns its place (for example a check for done, a warning sign for caution); never decorative.
+Follow the phone-formatting rules in the system prompt.
 
 ## Assistant Actions
 
@@ -107,30 +96,7 @@ One `telegram_voice` comment creates one voice artifact; voice does not use matr
 
 Keep speech TTS-friendly: omit Markdown, tables, and raw code. Voice delivery creates OGG/Opus itself; do not attach duplicate audio. Explicit voice remains available regardless of automatic `hidden`, `mirror`, or `always` policy.
 
-Author voice text for the ear, not the eye. The spoken text is yours to write; it
-need not match the displayed reply:
-
-- Restore proper spelling and diacritics even when the user typed without them.
-- Set `lang` to the dominant language of the spoken text (for example `cs` for Czech) so a native voice reads it; leave `lang` unset for heavily mixed text.
-- Expand abbreviations, numbers, URLs, and file paths into speakable words. Say "pi dot dev" rather than a raw URL.
-- No emoji, no bullet syntax, no heading marks.
-- Write speech as one flowing stream, the way people actually leave voice notes. Every period becomes a long synthetic pause, so prefer commas and connectors over full stops, and never use staccato runs of short sentences. One or two periods per note is plenty.
-- Use natural spoken connectors of the target language to carry the flow, and contractions where the language has them.
-- Keep one note under roughly forty-five seconds of speech; split longer content into more than one `telegram_voice` comment.
-- If synthesis fails, the bridge falls back to a text reply on its own; never send the same content twice.
-
-Inbound voice recovery. A voice or audio attachment normally arrives with its
-transcript in `[outputs]`. When the transcript is missing or empty (the
-transcription handler was not loaded, or it failed), do not guess and do not
-tell the user it cannot be read. Transcribe it yourself:
-
-```bash
-~/.pi/agent/skills/edge-tts/scripts/transcribe-gemini.sh --file <attachment-path>
-```
-
-This works on any audio file the bridge has downloaded, including ones from
-before the handler existed. Only report failure if that command itself fails,
-and then say exactly that the transcription service failed.
+Before authoring speech, read [`references/voice.md`](./references/voice.md).
 
 ## Files And Safety
 
@@ -150,11 +116,12 @@ When maintained capability guidance advertises an existing Generative App for th
 
 ## Conditional References
 
-Read only when the current task needs the capability:
+Read only when the task needs it:
 
 - Explicit local, cross-target, or Thread delivery: [`references/delivery-and-threads.md`](./references/delivery-and-threads.md)
 - Voice/media handler configuration or public extension APIs: [`references/configuration.md`](./references/configuration.md)
 - Bridge health or failure diagnosis: [`references/diagnosis.md`](./references/diagnosis.md)
+- Speech authoring, or inbound voice without a transcript: [`references/voice.md`](./references/voice.md)
 
 ## Completion Check
 

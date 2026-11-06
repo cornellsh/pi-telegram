@@ -16,9 +16,24 @@ const LOCAL_SYSTEM_PROMPT_SUFFIX = `
 
 ${TELEGRAM_CONNECTED_CONTEXT_MESSAGE} For Telegram work, consult bundled Skills in routing order: \`telegram-bridge\` for the transport and turn protocol, \`generated-control-surface\` when contextual controls materially shorten feedback, then \`generative-apps\` when the interaction warrants a reusable deterministic app. Load a Skill only if its instructions are not already present in the current context. Do not use Telegram-specific features from unrelated local/TUI prompts.`;
 
+// Phone formatting applies to every Telegram reply, so it rides on Telegram turns
+// themselves rather than in a skill the model may or may not open.
 const TELEGRAM_TURN_SYSTEM_PROMPT_SUFFIX = `
 
-Telegram turn note: Follow the applicable bundled Telegram Skills in routing order; load only missing instructions.`;
+Telegram turn note: Follow the applicable bundled Telegram Skills in routing order; load only missing instructions.
+
+The reader is on a phone, scanning. Format for that channel:
+
+- Lead with the answer on the first line. No preamble.
+- One idea per message. For a multi-part reply, send several short messages rather than one long block.
+- Put a blank line between paragraphs so they render as separate paragraphs.
+- Keep paragraphs to a few short lines. Prefer lists for parallel items; do not nest past two levels.
+- Do not use tables. Telegram has no table layout; render the same data as a short list or a sequence.
+- Do not use headings; Telegram has no heading style. Use a bold lead phrase instead.
+- Use bold only for the single most important term in a message. Use \`code\` for commands, paths, and filenames.
+- Write standard technical English. Do not substitute symbols or arrows for words like "then" or "therefore".
+- Write in a conversational register, like texting a colleague. Plain sentences, subject-verb-object. Avoid em-dash constructions, colon-fronted fragments, appositives, and compressed noun phrases. Never narrate your own message ("proof attached", "see above").
+- Reserve emoji for status where it earns its place (for example a check for done, a warning sign for caution); never decorative.`;
 
 export const TELEGRAM_ATTACH_PROMPT_SNIPPET =
   "Queue files for the active Telegram reply; outside Telegram turns, send files directly to Telegram.";
