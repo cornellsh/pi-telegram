@@ -57,6 +57,13 @@ export interface TelegramBusProcessRuntime {
   processId: number;
   processBirthId: string;
   manualFollowerOwnerId: string;
+  /**
+   * The owner identity this session had before pane keying: its parent shell.
+   * Topics created by older builds are keyed by it, so a session presents it
+   * as an alias to reclaim its own topic after a restart. Absent whenever the
+   * parent is shared (the tmux server, launchd), where it identifies nothing.
+   */
+  legacyManualFollowerOwnerId?: string;
   getLeaderSocketPath: () => string;
   getFollowerSocketPath: () => string;
 }
@@ -130,6 +137,64 @@ export function getTelegramProcessBirthProof(
   return { status: "unverifiable" };
 }
 
+/** `[[dd-]hh:]mm:ss` from `ps -o etime=`, in seconds. */
+export function parseTelegramProcessElapsedSeconds(etime: string): number | undefined {
+  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$/u.exec(etime.trim());
+  if (!match) return undefined;
+  const [, days, hours, minutes, seconds] = match;
+  return (
+    Number(days ?? 0) * 86_400 +
+    Number(hours ?? 0) * 3_600 +
+    Number(minutes) * 60 +
+    Number(seconds)
+  );
+}
+
+function readProcessElapsedSeconds(pid: number): number | undefined {
+  try {
+    return parseTelegramProcessElapsedSeconds(
+      execFileSync("/bin/ps", ["-o", "etime=", "-p", String(pid)], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      }),
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * True only when the process behind a bus instance id (`<pid>:<createdAtMs>`)
+ * provably no longer exists: the pid is free, or it now belongs to a process
+ * started after that instance was created (pid reuse). Anything unreadable is
+ * reported as not gone, because the caller drops records on this answer.
+ *
+ * pid reuse is the case that matters: records of sessions killed weeks ago
+ * named low pids that unrelated processes had since taken, so every liveness
+ * check said "alive" and 21 dead records held 21 of the 26 slot letters.
+ */
+export function isTelegramBusInstanceProcessGone(
+  instanceId: string,
+  options: {
+    isProcessAlive?: (pid: number) => boolean;
+    readElapsedSeconds?: (pid: number) => number | undefined;
+    nowMs?: number;
+  } = {},
+): boolean {
+  const match = /^(\d+):(\d+)$/u.exec(instanceId);
+  if (!match) return false;
+  const pid = Number(match[1]);
+  const createdAtMs = Number(match[2]);
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  if (!(options.isProcessAlive ?? isProcessAlive)(pid)) return true;
+  const elapsed = (options.readElapsedSeconds ?? readProcessElapsedSeconds)(pid);
+  if (elapsed === undefined) return false;
+  const startedAtMs = (options.nowMs ?? Date.now()) - elapsed * 1000;
+  // A process cannot create its runtime before it starts; generous slack for
+  // the one-second resolution of etime and clock adjustments.
+  return startedAtMs > createdAtMs + 60_000;
+}
+
 export function getTelegramProcessBirthIdentity(
   pid: number,
   fallbackGeneration: number | string,
@@ -193,6 +258,9 @@ export function createCurrentTelegramBusProcessRuntime(input: {
     // process environment is consulted for the tmux pane.
     parentProcessIdentity:
       input.parentPid === undefined ? getTelegramTmuxPaneOwnerIdentity() : undefined,
+    sharedParentPids: [Number(process.env.TMUX?.split(",")[1])].filter(
+      (pid) => Number.isInteger(pid) && pid > 0,
+    ),
     createdAtMs: input.createdAtMs ?? Date.now(),
   });
 }
@@ -202,19 +270,30 @@ export function createTelegramBusProcessRuntime(input: {
   pid: number;
   parentPid: number;
   parentProcessIdentity?: string;
+  /** Parents shared by unrelated sessions (the tmux server): never an owner. */
+  sharedParentPids?: readonly number[];
   createdAtMs: number;
 }): TelegramBusProcessRuntime {
   const instanceId = `${input.pid}:${input.createdAtMs}`;
   // pid 1 (launchd/init) parents every orphan and daemon: never a session slot.
   const ownerPid = input.parentPid && input.parentPid !== 1 ? input.parentPid : input.pid;
+  const parentIdentity =
+    ownerPid !== input.pid && !input.sharedParentPids?.includes(ownerPid)
+      ? getTelegramProcessBirthIdentity(ownerPid, input.createdAtMs)
+      : undefined;
   const manualFollowerOwnerId =
     input.parentProcessIdentity ??
     getTelegramProcessBirthIdentity(ownerPid, input.createdAtMs);
+  const legacyManualFollowerOwnerId =
+    input.parentProcessIdentity && parentIdentity && parentIdentity !== manualFollowerOwnerId
+      ? parentIdentity
+      : undefined;
   return {
     instanceId,
     processId: input.pid,
     processBirthId: getTelegramProcessBirthIdentity(input.pid, instanceId),
     manualFollowerOwnerId,
+    ...(legacyManualFollowerOwnerId ? { legacyManualFollowerOwnerId } : {}),
     getLeaderSocketPath: () =>
       getTelegramBusSocketPath(
         undefined,
@@ -361,6 +440,8 @@ export interface TelegramBusInstanceRegistration {
   instanceId: string;
   previousInstanceId?: string;
   profileKey?: string;
+  /** Older keys that also identify this session (see legacyManualFollowerOwnerId). */
+  profileKeyAliases?: string[];
   threadName?: string;
   slot?: string;
   cwd?: string;
@@ -2702,6 +2783,13 @@ function parseRegistration(
   }
   if (typeof value.profileKey === "string")
     registration.profileKey = value.profileKey;
+  if (
+    Array.isArray(value.profileKeyAliases) &&
+    value.profileKeyAliases.length <= 4 &&
+    value.profileKeyAliases.every((alias) => typeof alias === "string" && alias.length > 0 && alias.length <= 512)
+  ) {
+    registration.profileKeyAliases = [...(value.profileKeyAliases as string[])];
+  }
   if (typeof value.threadName === "string")
     registration.threadName = value.threadName;
   if (typeof value.slot === "string" && /^[A-Z]$/.test(value.slot)) {

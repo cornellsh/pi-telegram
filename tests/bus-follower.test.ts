@@ -2991,3 +2991,59 @@ test("follower client defaults the forwarding timeout to the 30s bus window", as
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("Bus follower refused by a live leader backs off instead of retrying every grace", async () => {
+  const { getTelegramBusFollowerRecoveryDelayMs, TELEGRAM_BUS_FOLLOWER_RECOVERY_MAX_DELAY_MS } = await import("../lib/bus-follower.ts");
+  const delays: number[] = [];
+  let pending: (() => void) | undefined;
+  let registrations = 0;
+  let accept = false;
+  const registrationState = createTelegramBusFollowerRegistrationState();
+  registrationState.setRegistered(true, { chatId: 42, threadId: 10 });
+  const liveLock = { pid: 7, leaderEpoch: "live" };
+  const handler = createTelegramBusFollowerHeartbeatRecoveryHandler({
+    registrationState,
+    getRegistrationRuntime: () => ({
+      registerWithLeader: async () => {
+        registrations += 1;
+        if (!accept) throw new Error("Telegram topic creation paused for 900s");
+        return true;
+      },
+      setContext: () => undefined,
+      stop: () => undefined,
+    }),
+    getLeaderState: () => ({ kind: "active-elsewhere", lock: liveLock }),
+    setLifecyclePhase: () => undefined,
+    updateStatus: () => undefined,
+    promoteToLeader: async () => true,
+    sleep: async () => undefined,
+    scheduleRetry: (retry, delayMs) => {
+      delays.push(delayMs);
+      pending = retry;
+    },
+    getActiveContext: () => "ctx",
+    promotionGraceMs: 2_500,
+    recordRuntimeEvent: () => undefined,
+  });
+
+  await handler(new Error("heartbeat failed"), "ctx");
+  for (let i = 0; i < 12; i += 1) {
+    const next = pending!;
+    pending = undefined;
+    next();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.deepEqual(delays.slice(0, 5), [2_500, 5_000, 10_000, 20_000, 40_000]);
+  assert.equal(delays.at(-1), TELEGRAM_BUS_FOLLOWER_RECOVERY_MAX_DELAY_MS);
+  assert.equal(registrations, 26, "two attempts per recovery, no hidden retries");
+
+  // Once a registration succeeds the next failure starts over at the grace.
+  accept = true;
+  pending!();
+  await new Promise((resolve) => setImmediate(resolve));
+  accept = false;
+  delays.length = 0;
+  await handler(new Error("heartbeat failed again"), "ctx");
+  assert.deepEqual(delays, [2_500]);
+  assert.equal(getTelegramBusFollowerRecoveryDelayMs(2_500, 1), 2_500);
+});

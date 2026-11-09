@@ -33,6 +33,7 @@ import {
   TELEGRAM_BUS_CAPABILITY_DURABLE_FOLLOWER_ADMISSION,
   TELEGRAM_BUS_CAPABILITY_QUEUE_HANDOFF,
   TELEGRAM_BUS_FOLLOWER_LIVE_WINDOW_MS,
+  isTelegramBusInstanceProcessGone,
 } from "./bus.ts";
 import { getTelegramBusTransportRetryPolicy } from "./bus-transport.ts";
 import type { TelegramQueueHandoffPayload } from "./queue.ts";
@@ -120,6 +121,8 @@ export interface TelegramBusFollowerTargetProvisionerDeps {
    * profile key: that is a second live session, not a restart.
    */
   isFollowerLive?: (instanceId: string) => boolean;
+  /** Defaults to the real process check; injectable for tests. */
+  isInstanceProcessGone?: (instanceId: string) => boolean;
   getAllowedUserId: () => number | undefined;
   topicTargetStore: Threads.TelegramTopicTargetStore;
   callApi: <TResponse>(
@@ -428,6 +431,24 @@ export function createTelegramBusFollowerTargetProvisioner(
       // Telegram and therefore invisible to the operator.
       claimPendingTargets: false,
     });
+    if (deps.isFollowerLive) {
+      const isFollowerLive = deps.isFollowerLive;
+      const dropped = Threads.pruneTelegramDeadFollowerRecords(deps.topicTargetStore, {
+        nowMs: getNowMs(),
+        isFollowerLive: (instanceId) =>
+          instanceId === registration.instanceId || isFollowerLive(instanceId),
+        isInstanceProcessGone:
+          deps.isInstanceProcessGone ??
+          ((instanceId) => isTelegramBusInstanceProcessGone(instanceId)),
+      });
+      if (dropped > 0) {
+        await deps.topicTargetStore.persist();
+        deps.recordRuntimeEvent("bus", "Dropped records of sessions that ended without disconnecting", {
+          phase: "follower-register-prune-dead-records",
+          dropped,
+        });
+      }
+    }
     const recordsBeforeProvision = deps.topicTargetStore.list();
     const followerProfileKeyBase =
       registration.profileKey ?? `manual:${registration.instanceId}`;
@@ -461,7 +482,12 @@ export function createTelegramBusFollowerTargetProvisioner(
           record.target.threadId === requestedTarget.threadId);
       const matchesCurrentIdentity =
         record.instanceId === registration.instanceId ||
-        record.profileKey === followerProfileKey;
+        record.profileKey === followerProfileKey ||
+        // A topic an older build keyed by this session's parent shell. The
+        // record is re-keyed to the current identity once reclaimed.
+        (!liveCollision &&
+          !!record.profileKey &&
+          (registration.profileKeyAliases ?? []).includes(record.profileKey));
       const matchesSessionHandoff =
         !!requestedTarget &&
         !!registration.previousInstanceId &&

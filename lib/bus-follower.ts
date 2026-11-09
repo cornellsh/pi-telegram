@@ -262,6 +262,7 @@ export interface TelegramBusFollowerRegistrationRuntimeDeps<
   registrationState?: TelegramBusFollowerRegistrationState;
   isContextActive?: (ctx: TContext) => boolean;
   getProfileKey?: (ctx: TContext) => string | undefined;
+  getProfileKeyAliases?: (ctx: TContext) => string[] | undefined;
   getThreadName?: (ctx: TContext) => string | undefined;
   getNowMs?: () => number;
   getPid?: () => number;
@@ -291,6 +292,20 @@ export function createTelegramManualFollowerProfileKeyResolver(input: {
       instanceId: input.manualFollowerOwnerId,
       telegramProfile: input.getActiveProfileName(),
     });
+}
+
+/** Older profile keys that also identify this session, for topic reclaim. */
+export function createTelegramManualFollowerProfileKeyAliasesResolver(input: {
+  getActiveProfileName: () => string | undefined;
+  legacyManualFollowerOwnerId?: string;
+}): () => string[] | undefined {
+  const legacy = input.legacyManualFollowerOwnerId;
+  if (!legacy) return () => undefined;
+  const resolve = createTelegramManualFollowerProfileKeyResolver({
+    getActiveProfileName: input.getActiveProfileName,
+    manualFollowerOwnerId: legacy,
+  });
+  return () => [resolve()];
 }
 
 export interface TelegramBusFollowerElection {
@@ -1191,6 +1206,24 @@ export function createTelegramBusFollowerRegistrationState(
   };
 }
 
+/** Longest wait between follower recovery attempts. */
+export const TELEGRAM_BUS_FOLLOWER_RECOVERY_MAX_DELAY_MS = 5 * 60_000;
+
+/**
+ * Delay before recovery attempt `failures` (1-based): the promotion grace,
+ * doubling per consecutive failure, capped. Quick when a leader is merely
+ * reloading, quiet when the refusal is not going away.
+ */
+export function getTelegramBusFollowerRecoveryDelayMs(
+  graceMs: number,
+  failures: number,
+): number {
+  return Math.min(
+    graceMs * 2 ** Math.max(0, Math.min(failures - 1, 16)),
+    TELEGRAM_BUS_FOLLOWER_RECOVERY_MAX_DELAY_MS,
+  );
+}
+
 export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
   deps: TelegramBusFollowerHeartbeatRecoveryHandlerDeps<TContext>,
 ): (error: unknown, ctx: TContext) => Promise<void> {
@@ -1206,6 +1239,11 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       timer.unref?.();
     });
   let promotionPending = false;
+  // Consecutive recoveries that ended without a registration. A follower the
+  // leader keeps refusing used to retry every promotion grace (2.5 s) forever;
+  // each retry was a full registration and, when its topic was gone, a topic
+  // creation. One refusal reason (a Telegram outage) made 669 tabs that way.
+  let failedRecoveries = 0;
   const safeUpdateStatus = (ctx: TContext) => {
     try {
       deps.updateStatus(ctx);
@@ -1237,6 +1275,7 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       if (!restored) return false;
       deps.setLifecyclePhase(undefined);
       safeUpdateStatus(ctx);
+      failedRecoveries = 0;
       deps.recordRuntimeEvent(
         "bus",
         "Telegram follower registration restored",
@@ -1271,7 +1310,11 @@ export function createTelegramBusFollowerHeartbeatRecoveryHandler<TContext>(
       }
       void recover(reason, activeCtx, binding);
     };
-    scheduleRetry(retry, promotionGraceMs);
+    failedRecoveries += 1;
+    scheduleRetry(
+      retry,
+      getTelegramBusFollowerRecoveryDelayMs(promotionGraceMs, failedRecoveries),
+    );
   };
   const promoteToLeader = async (
     reason: unknown,
@@ -1622,6 +1665,9 @@ export function createTelegramBusFollowerRegistrationRuntime<
           profileKey:
             deps.getProfileKey?.(ctx) ??
             (ctx.cwd ? `cwd:${ctx.cwd}` : undefined),
+          ...((deps.getProfileKeyAliases?.(ctx)?.length ?? 0) > 0
+            ? { profileKeyAliases: deps.getProfileKeyAliases!(ctx) }
+            : {}),
           threadName:
             deps.registrationState?.getThreadName() ??
             lastKnownThreadName ??

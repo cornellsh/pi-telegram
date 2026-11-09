@@ -88,6 +88,7 @@ export default function (pi: Pi.ExtensionAPI) {
     processId: telegramProcessId,
     processBirthId: telegramQueueProcessBirthId,
     manualFollowerOwnerId: telegramManualFollowerOwnerId,
+    legacyManualFollowerOwnerId: telegramLegacyManualFollowerOwnerId,
     getLeaderSocketPath: getTelegramBusSocketPath,
     getFollowerSocketPath: getTelegramBusFollowerSocketPath,
   } = busProcessRuntime;
@@ -1037,6 +1038,11 @@ export default function (pi: Pi.ExtensionAPI) {
         setActiveAuthSecret:
           telegramBusFollowerControlState.setActiveAuthSecret,
         getProfileKey: getTelegramManualFollowerProfileKey,
+        getProfileKeyAliases:
+          BusFollower.createTelegramManualFollowerProfileKeyAliasesResolver({
+            getActiveProfileName: configStore.getActiveProfileName,
+            legacyManualFollowerOwnerId: telegramLegacyManualFollowerOwnerId,
+          }),
         getProcessBirthId() {
           return telegramQueueProcessBirthId;
         },

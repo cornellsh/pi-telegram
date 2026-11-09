@@ -2562,3 +2562,34 @@ test("registry never evicts a live holder over a shared profile key, only over t
   assert.equal(registry.get("router"), undefined, "a silent holder under the same key is a restart and goes");
 });
 
+
+test("a pane-keyed session also carries its parent shell as a legacy owner, never a shared parent", async () => {
+  const { createTelegramBusProcessRuntime } = await import("../lib/bus.ts");
+  const base = { getActiveProfileName: () => undefined, pid: process.pid, createdAtMs: 1 };
+  const shell = createTelegramBusProcessRuntime({ ...base, parentPid: process.ppid, parentProcessIdentity: "srv:pane:%7" });
+  assert.equal(shell.manualFollowerOwnerId, "srv:pane:%7");
+  assert.ok(shell.legacyManualFollowerOwnerId?.startsWith(`${process.ppid}:`), "the shell identity older builds used");
+  const viaServer = createTelegramBusProcessRuntime({ ...base, parentPid: process.ppid, parentProcessIdentity: "srv:pane:%8", sharedParentPids: [process.ppid] });
+  assert.equal(viaServer.legacyManualFollowerOwnerId, undefined, "the tmux server is shared by every window");
+  const orphan = createTelegramBusProcessRuntime({ ...base, parentPid: 1, parentProcessIdentity: "srv:pane:%9" });
+  assert.equal(orphan.legacyManualFollowerOwnerId, undefined);
+  const outsideTmux = createTelegramBusProcessRuntime({ ...base, parentPid: process.ppid });
+  assert.equal(outsideTmux.legacyManualFollowerOwnerId, undefined, "nothing to migrate from");
+});
+
+test("an instance whose pid now belongs to a younger process is gone", async () => {
+  const { isTelegramBusInstanceProcessGone, parseTelegramProcessElapsedSeconds } = await import("../lib/bus.ts");
+  assert.equal(parseTelegramProcessElapsedSeconds("05:07"), 307);
+  assert.equal(parseTelegramProcessElapsedSeconds("2:05:07"), 7507);
+  assert.equal(parseTelegramProcessElapsedSeconds("16-10:23:48"), 16 * 86_400 + 37_428);
+  assert.equal(parseTelegramProcessElapsedSeconds("garbage"), undefined);
+  const now = 10_000_000_000;
+  const created = now - 30 * 86_400_000; // instance created a month ago
+  const base = { nowMs: now, isProcessAlive: () => true };
+  assert.equal(isTelegramBusInstanceProcessGone(`1481:${created}`, { ...base, isProcessAlive: () => false }), true, "free pid");
+  assert.equal(isTelegramBusInstanceProcessGone(`1481:${created}`, { ...base, readElapsedSeconds: () => 3_600 }), true, "pid reused an hour ago");
+  assert.equal(isTelegramBusInstanceProcessGone(`1481:${created}`, { ...base, readElapsedSeconds: () => 31 * 86_400 }), false, "the original process");
+  assert.equal(isTelegramBusInstanceProcessGone(`1481:${created}`, { ...base, readElapsedSeconds: () => undefined }), false, "unreadable is not gone");
+  assert.equal(isTelegramBusInstanceProcessGone("not-an-instance", base), false);
+  assert.equal(isTelegramBusInstanceProcessGone(`${process.pid}:${Date.now()}`), false, "this process");
+});

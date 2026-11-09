@@ -3046,3 +3046,46 @@ test("the connected notice is posted at most once a minute per topic; later prob
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a pane-keyed session reclaims the topic an older build keyed by its parent shell", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-legacy-alias-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  seed(store, "old-pi"); // keyed "manual:shared", i.e. the parent shell's identity
+  const calls: { method: string; body: Record<string, unknown> }[] = [];
+  try {
+    const provision = provisioner(store, new Set(), calls, { ms: 1001 });
+    const got = await provision({
+      instanceId: "restarted-pi",
+      profileKey: "manual:rt:server:pane:%7",
+      profileKeyAliases: ["manual:shared"],
+      connectedAtMs: 1001,
+    });
+    assert.equal(got?.threadId, 42, "the session keeps its topic across the identity change");
+    assert.ok(!calls.some((c) => c.method === "createForumTopic"), "no duplicate tab");
+    const record = store.list().find((r) => r.target.threadId === 42);
+    assert.equal(record?.profileKey, "manual:rt:server:pane:%7", "re-keyed to the current identity");
+    assert.equal(record?.instanceId, "restarted-pi");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an alias never takes a topic from a live session", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-legacy-alias-live-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  seed(store, "other-live-pi");
+  const calls: { method: string; body: Record<string, unknown> }[] = [];
+  try {
+    const provision = provisioner(store, new Set(["other-live-pi"]), calls, { ms: 1001 });
+    const got = await provision({
+      instanceId: "newcomer",
+      profileKey: "manual:rt:server:pane:%9",
+      profileKeyAliases: ["manual:shared"],
+      connectedAtMs: 1001,
+    });
+    assert.notEqual(got?.threadId, 42);
+    assert.equal(store.list().find((r) => r.target.threadId === 42)?.instanceId, "other-live-pi");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
