@@ -3316,3 +3316,130 @@ test("topic names never keep an unreplaced {slot} placeholder", () => {
   assert.equal(getTelegramTopicName({ ...request, threadName: "router" }, "{threadName}", undefined), "router");
 });
 
+
+test("topic creation stops looping when Telegram refuses new topics", async () => {
+  const { isTelegramTopicCreationDeferredError, TELEGRAM_TOPIC_CREATE_OUTAGE_COOLDOWN_MS } = await import("../lib/threads.ts");
+  const root = await mkdtemp(join(tmpdir(), "telegram-create-guard-"));
+  try {
+    const store = createTelegramTopicTargetStore({ path: join(root, "state.json") });
+    let now = 1_000_000;
+    let creates = 0;
+    let outage = true;
+    const provision = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store,
+      getNowMs: () => now,
+      async callApi<TResponse>(method: string) {
+        if (method !== "createForumTopic") return {} as TResponse;
+        creates += 1;
+        if (outage) throw new Error("Telegram API createForumTopic failed: HTTP 400: Bad Request: BOT_TOPIC_WRONG_HOME");
+        return { message_thread_id: 500 + creates } as TResponse;
+      },
+    });
+    const register = (n: number) =>
+      provision({ instanceId: `inst-${n}`, profileKey: `manual:pane-${n}`, owner: { kind: "manual-follower", instanceId: `pane-${n}` } });
+
+    await assert.rejects(register(1), /BOT_TOPIC_WRONG_HOME/u);
+    // The re-registration loop that made 669 tabs: every retry is refused locally.
+    for (let i = 0; i < 50; i += 1) {
+      now += 2_500;
+      await assert.rejects(register(i % 3), (error: unknown) => isTelegramTopicCreationDeferredError(error));
+    }
+    assert.equal(creates, 1, "one call reached Telegram during the outage");
+
+    // After the cooldown one probe is allowed; a second refusal doubles it.
+    now = 1_000_000 + TELEGRAM_TOPIC_CREATE_OUTAGE_COOLDOWN_MS;
+    await assert.rejects(register(7), /BOT_TOPIC_WRONG_HOME/u);
+    now += TELEGRAM_TOPIC_CREATE_OUTAGE_COOLDOWN_MS;
+    await assert.rejects(register(8), (error: unknown) => isTelegramTopicCreationDeferredError(error));
+    assert.equal(creates, 2);
+
+    // Recovery: the next allowed attempt succeeds and clears the breaker.
+    outage = false;
+    now += TELEGRAM_TOPIC_CREATE_OUTAGE_COOLDOWN_MS * 2;
+    const ok = await register(9);
+    assert.equal(ok.reused, false);
+    now += 1_000;
+    assert.equal((await register(10)).reused, false, "no cooldown after a success");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("one session cannot create topics without bound, others still can", async () => {
+  const { isTelegramTopicCreationDeferredError, TELEGRAM_TOPIC_CREATE_PROFILE_MAX, TELEGRAM_TOPIC_CREATE_BURST_MAX } = await import("../lib/threads.ts");
+  const root = await mkdtemp(join(tmpdir(), "telegram-create-rate-"));
+  try {
+    const store = createTelegramTopicTargetStore({ path: join(root, "state.json") });
+    let now = 5_000_000;
+    let thread = 900;
+    const provision = createTelegramTopicTargetProvisioner({
+      topicChatId: -1001,
+      store,
+      getNowMs: () => now,
+      async callApi<TResponse>(method: string) {
+        return (method === "createForumTopic" ? { message_thread_id: (thread += 1) } : {}) as TResponse;
+      },
+    });
+    // Same profile, each new instance (a process that keeps losing its topic).
+    for (let i = 0; i < TELEGRAM_TOPIC_CREATE_PROFILE_MAX; i += 1) {
+      now += 1_000;
+      store.markStaleByTarget?.({ chatId: -1001, threadId: thread }, "deleted", "gone");
+      await provision({ instanceId: `loop-${i}`, profileKey: "manual:loop", owner: { kind: "manual-follower", instanceId: "loop" } });
+    }
+    now += 1_000;
+    store.markStaleByTarget?.({ chatId: -1001, threadId: thread }, "deleted", "gone");
+    await assert.rejects(
+      provision({ instanceId: "loop-x", profileKey: "manual:loop", owner: { kind: "manual-follower", instanceId: "loop" } }),
+      (error: unknown) => isTelegramTopicCreationDeferredError(error),
+    );
+    // A different session is not punished for the loop...
+    let made = TELEGRAM_TOPIC_CREATE_PROFILE_MAX;
+    for (let i = 0; made < TELEGRAM_TOPIC_CREATE_BURST_MAX; i += 1, made += 1) {
+      now += 1_000;
+      await provision({ instanceId: `other-${i}`, profileKey: `manual:other-${i}`, owner: { kind: "manual-follower", instanceId: `other-${i}` } });
+    }
+    // ...until the overall ceiling.
+    await assert.rejects(
+      provision({ instanceId: "one-more", profileKey: "manual:one-more", owner: { kind: "manual-follower", instanceId: "one-more" } }),
+      (error: unknown) => isTelegramTopicCreationDeferredError(error),
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("records of sessions that died without disconnecting stop holding slots", async () => {
+  const { pruneTelegramDeadFollowerRecords, TELEGRAM_DEAD_FOLLOWER_RECORD_GRACE_MS } = await import("../lib/threads.ts");
+  const root = await mkdtemp(join(tmpdir(), "telegram-prune-dead-"));
+  try {
+    const store = createTelegramTopicTargetStore({ path: join(root, "state.json"), getNowMs: () => 1_000 });
+    const add = (id: string, thread: number, slot: string, updatedAtMs: number, kind: "manual-follower" | "leader" = "manual-follower") =>
+      store.upsert({
+        profileKey: kind === "leader" ? `cwd:/${id}` : `manual:${id}`,
+        owner: kind === "leader" ? { kind: "leader", cwd: `/${id}`, instanceId: id } : { kind: "manual-follower", instanceId: id },
+        target: { chatId: 7, threadId: thread },
+        status: "active",
+        createdAtMs: 1,
+        updatedAtMs,
+        instanceId: id,
+        slot,
+        threadName: id,
+      });
+    const now = 100 * TELEGRAM_DEAD_FOLLOWER_RECORD_GRACE_MS;
+    add("dead-old", 1, "B", 1);
+    add("dead-recent", 2, "C", now - 1_000); // may still be restarting
+    add("live", 3, "D", 1);
+    add("alive-unregistered", 4, "E", 1); // process alive, briefly unregistered
+    add("leader-own", 5, "F", 1, "leader");
+    const dropped = pruneTelegramDeadFollowerRecords(store, {
+      nowMs: now,
+      isFollowerLive: (id) => id === "live",
+      isInstanceProcessGone: (id) => id.startsWith("dead") || id === "leader-own",
+    });
+    assert.equal(dropped, 1);
+    assert.deepEqual(store.list().map((r) => r.target.threadId).sort(), [2, 3, 4, 5]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

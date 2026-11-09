@@ -3104,6 +3104,208 @@ export function createTelegramTopicTargetRenamer(
   };
 }
 
+/**
+ * Topic creation is the one Telegram call whose failure loops are visible to
+ * the operator: every attempt may leave a tab behind.
+ *
+ * On 09.11.2026 Telegram's private-chat topic backend broke: createForumTopic
+ * answered `BOT_TOPIC_WRONG_HOME` yet still created the topic, and new topics
+ * refused bot writes. A follower whose topic had gone re-registered every 2.5 s,
+ * each attempt created another topic, and 669 identical "Maple" tabs appeared in
+ * 35 minutes. Nothing in the bridge limited how often it creates topics, so any
+ * fault that fails registration after creation becomes a tab factory.
+ *
+ * The guard is process-wide (only the leader creates topics) and keyed by chat:
+ * - a known platform outage pauses all creation, 15 minutes doubling to an hour;
+ * - any other failed creation backs off, 30 s doubling to 15 minutes;
+ * - one session creates at most three topics in ten minutes (a deliberate
+ *   disconnect and reconnect still gets its fresh tab at once);
+ * - no more than ten creations in ten minutes overall.
+ * A success clears the failure state. A refusal is an error the caller already
+ * handles as a failed registration, so it surfaces instead of looping.
+ */
+export const TELEGRAM_TOPIC_CREATE_OUTAGE_COOLDOWN_MS = 15 * 60_000;
+export const TELEGRAM_TOPIC_CREATE_OUTAGE_MAX_COOLDOWN_MS = 60 * 60_000;
+export const TELEGRAM_TOPIC_CREATE_FAILURE_BACKOFF_MS = 30_000;
+export const TELEGRAM_TOPIC_CREATE_FAILURE_MAX_BACKOFF_MS = 15 * 60_000;
+export const TELEGRAM_TOPIC_CREATE_PROFILE_MAX = 3;
+export const TELEGRAM_TOPIC_CREATE_BURST_WINDOW_MS = 10 * 60_000;
+export const TELEGRAM_TOPIC_CREATE_BURST_MAX = 10;
+
+interface TelegramTopicCreationGuardState {
+  blockedUntilMs: number;
+  blockedReason: string;
+  outageStreak: number;
+  failureStreak: number;
+  attemptsMs: number[];
+  attemptsByProfileMs: Map<string, number[]>;
+}
+
+// Keyed by the thread store: one leader has one store, so every provisioner it
+// builds shares a guard, while independent stores (tests, a second profile) never
+// throttle each other.
+const telegramTopicCreationGuards = new WeakMap<object, Map<string, TelegramTopicCreationGuardState>>();
+
+export class TelegramTopicCreationDeferredError extends Error {
+  readonly retryAfterMs: number;
+  constructor(reason: string, retryAfterMs: number) {
+    super(
+      `Telegram topic creation paused for ${Math.ceil(retryAfterMs / 1000)}s: ${reason}`,
+    );
+    this.name = "TelegramTopicCreationDeferredError";
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export function isTelegramTopicCreationDeferredError(
+  error: unknown,
+): error is TelegramTopicCreationDeferredError {
+  return error instanceof TelegramTopicCreationDeferredError;
+}
+
+function getTelegramTopicCreationGuard(scope: object, chatId: number | string): TelegramTopicCreationGuardState {
+  const key = String(chatId);
+  let byChat = telegramTopicCreationGuards.get(scope);
+  if (!byChat) {
+    byChat = new Map();
+    telegramTopicCreationGuards.set(scope, byChat);
+  }
+  let state = byChat.get(key);
+  if (!state) {
+    state = {
+      blockedUntilMs: 0,
+      blockedReason: "",
+      outageStreak: 0,
+      failureStreak: 0,
+      attemptsMs: [],
+      attemptsByProfileMs: new Map(),
+    };
+    byChat.set(key, state);
+  }
+  return state;
+}
+
+/** Telegram's private-chat topic outage, by its error text. */
+export function isTelegramTopicCreationOutageError(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? "");
+  return /BOT_TOPIC_WRONG_HOME/u.test(text);
+}
+
+/** Throws TelegramTopicCreationDeferredError when creation must wait; records the attempt otherwise. */
+export function admitTelegramTopicCreation(
+  scope: object,
+  chatId: number | string,
+  profileKey: string,
+  nowMs: number,
+): void {
+  const state = getTelegramTopicCreationGuard(scope, chatId);
+  if (nowMs < state.blockedUntilMs) {
+    throw new TelegramTopicCreationDeferredError(
+      state.blockedReason,
+      state.blockedUntilMs - nowMs,
+    );
+  }
+  const inWindow = (at: number) => nowMs - at < TELEGRAM_TOPIC_CREATE_BURST_WINDOW_MS;
+  const forProfile = (state.attemptsByProfileMs.get(profileKey) ?? []).filter(inWindow);
+  if (forProfile.length >= TELEGRAM_TOPIC_CREATE_PROFILE_MAX) {
+    throw new TelegramTopicCreationDeferredError(
+      `this session already created ${TELEGRAM_TOPIC_CREATE_PROFILE_MAX} topics in the last ten minutes`,
+      TELEGRAM_TOPIC_CREATE_BURST_WINDOW_MS - (nowMs - forProfile[0]!),
+    );
+  }
+  state.attemptsMs = state.attemptsMs.filter(inWindow);
+  if (state.attemptsMs.length >= TELEGRAM_TOPIC_CREATE_BURST_MAX) {
+    throw new TelegramTopicCreationDeferredError(
+      `${TELEGRAM_TOPIC_CREATE_BURST_MAX} topics were created in the last ten minutes`,
+      TELEGRAM_TOPIC_CREATE_BURST_WINDOW_MS - (nowMs - state.attemptsMs[0]!),
+    );
+  }
+  state.attemptsMs.push(nowMs);
+  state.attemptsByProfileMs.set(profileKey, [...forProfile, nowMs]);
+  for (const [key, times] of state.attemptsByProfileMs) {
+    if (!times.some(inWindow)) state.attemptsByProfileMs.delete(key);
+  }
+}
+
+export function recordTelegramTopicCreationOutcome(
+  scope: object,
+  chatId: number | string,
+  nowMs: number,
+  error?: unknown,
+): void {
+  const state = getTelegramTopicCreationGuard(scope, chatId);
+  if (error === undefined) {
+    state.outageStreak = 0;
+    state.failureStreak = 0;
+    state.blockedUntilMs = 0;
+    state.blockedReason = "";
+    return;
+  }
+  if (isTelegramTopicCreationOutageError(error)) {
+    state.outageStreak += 1;
+    const cooldown = Math.min(
+      TELEGRAM_TOPIC_CREATE_OUTAGE_COOLDOWN_MS * 2 ** (state.outageStreak - 1),
+      TELEGRAM_TOPIC_CREATE_OUTAGE_MAX_COOLDOWN_MS,
+    );
+    state.blockedUntilMs = Math.max(state.blockedUntilMs, nowMs + cooldown);
+    state.blockedReason =
+      "Telegram is refusing new private-chat topics (BOT_TOPIC_WRONG_HOME); existing topics keep working";
+    return;
+  }
+  state.failureStreak += 1;
+  const backoff = Math.min(
+    TELEGRAM_TOPIC_CREATE_FAILURE_BACKOFF_MS * 2 ** (state.failureStreak - 1),
+    TELEGRAM_TOPIC_CREATE_FAILURE_MAX_BACKOFF_MS,
+  );
+  state.blockedUntilMs = Math.max(state.blockedUntilMs, nowMs + backoff);
+  state.blockedReason = `the last topic creation failed (${
+    error instanceof Error ? error.message : String(error)
+  })`.slice(0, 300);
+}
+
+/** How long a dead session's record survives, for a restart to reclaim it. */
+export const TELEGRAM_DEAD_FOLLOWER_RECORD_GRACE_MS = 10 * 60_000;
+
+/**
+ * Drop current manual-follower records whose session process is provably gone.
+ *
+ * A session killed with its terminal never disconnects, and nothing removed its
+ * record: it stayed "active" for weeks, holding a slot letter. With every letter
+ * held, new topics fell back to the raw `{slot}` template. Only records that no
+ * live follower holds, whose process is gone, and that have been idle past the
+ * grace are dropped, so a restart can still reclaim its topic. Dropping does not
+ * touch Telegram; the orphaned tab is left to the tab reaper.
+ */
+export function pruneTelegramDeadFollowerRecords(
+  store: Pick<TelegramTopicTargetStore, "list" | "markStaleByTarget">,
+  input: {
+    nowMs: number;
+    isFollowerLive: (instanceId: string) => boolean;
+    isInstanceProcessGone: (instanceId: string) => boolean;
+    graceMs?: number;
+  },
+): number {
+  const graceMs = input.graceMs ?? TELEGRAM_DEAD_FOLLOWER_RECORD_GRACE_MS;
+  let dropped = 0;
+  for (const record of store.list()) {
+    if (record.owner?.kind !== "manual-follower") continue;
+    if (!isCurrentThreadRecord(record) || !record.instanceId) continue;
+    if (input.nowMs - (record.updatedAtMs ?? 0) < graceMs) continue;
+    if (input.isFollowerLive(record.instanceId)) continue;
+    if (!input.isInstanceProcessGone(record.instanceId)) continue;
+    if (
+      store.markStaleByTarget(
+        record.target,
+        "unknown",
+        "The owning session ended without disconnecting.",
+      )
+    ) {
+      dropped += 1;
+    }
+  }
+  return dropped;
+}
+
 export function createTelegramTopicTargetProvisioner(
   deps: TelegramTopicTargetProvisionerDeps,
 ): (
@@ -3223,6 +3425,10 @@ export function createTelegramTopicTargetProvisioner(
       isTelegramTopicThreadNameValidForSlot(candidateThreadName, slot)
         ? candidateThreadName
         : chooseTelegramThreadName({ slot, entropy: nowMs, getRandom });
+    // Wall clock, not getNowMs: the guard must measure real time across
+    // provisioners, and getNowMs defaults to a constant.
+    const guardNowMs = deps.getNowMs ? nowMs : Date.now();
+    admitTelegramTopicCreation(deps.store, deps.topicChatId, request.profileKey, guardNowMs);
     const pendingId = `provision:${request.instanceId}:${slot}:${nowMs}`;
     const pendingOwner =
       request.owner?.kind === "leader" ? "leader" : "manual-follower";
@@ -3258,6 +3464,15 @@ export function createTelegramTopicTargetProvisioner(
           ),
         },
         { maxAttempts: 1 },
+      ).then(
+        (value) => {
+          recordTelegramTopicCreationOutcome(deps.store, deps.topicChatId, guardNowMs);
+          return value;
+        },
+        (error: unknown) => {
+          recordTelegramTopicCreationOutcome(deps.store, deps.topicChatId, guardNowMs, error);
+          throw error;
+        },
       );
       threadId = topic.message_thread_id;
       if (typeof threadId !== "number" || !Number.isInteger(threadId)) {
