@@ -351,6 +351,7 @@ export function createTelegramAutoConnectBinding<TContext>(
 ): {
   onSessionStart: (mode: string, ctx: TContext) => void;
   onManualDisconnect: () => void;
+  onSessionShutdown: () => void;
 } {
   let liveContext: TContext | undefined;
   const supervisor = createTelegramAutoConnectSupervisor<TContext>(
@@ -362,13 +363,24 @@ export function createTelegramAutoConnectBinding<TContext>(
     },
     () => liveContext,
   );
-  return createTelegramAutoConnectSessionRuntime<TContext>({
+  const session = createTelegramAutoConnectSessionRuntime<TContext>({
     ...deps,
     supervisor,
     rememberContext: (ctx) => {
       liveContext = ctx;
     },
   });
+  return {
+    ...session,
+    // A reload builds a fresh bridge but cannot clear the old one's timers.
+    // The old supervisor kept watching with a context pi had invalidated, so
+    // every reload left a watcher that saw "disconnected" (its own runtime was
+    // gone) and tried to reconnect, failing on the stale context, forever.
+    onSessionShutdown() {
+      supervisor.stop();
+      liveContext = undefined;
+    },
+  };
 }
 
 export interface TelegramAutoConnectSessionRuntimeDeps {

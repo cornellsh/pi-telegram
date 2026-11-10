@@ -367,3 +367,27 @@ test("An already-connected process performs no attempt at all", async () => {
   assert.equal(result, "already-connected");
   assert.equal(calls, 0);
 });
+
+test("session shutdown stops the reconnect watcher so a reload leaves none behind", async () => {
+  const { createTelegramAutoConnectBinding } = await import("../lib/auto-connect.ts");
+  const events: string[] = [];
+  let connects = 0;
+  const binding = createTelegramAutoConnectBinding<{ id: string }>({
+    isAutoConnectEnabled: () => true,
+    hasBotToken: () => true,
+    isConnected: () => false, // what the old runtime reports once it is torn down
+    getConnectHandler: () => async () => {
+      connects += 1;
+    },
+    recordRuntimeEvent: (_c, error, details) => events.push(String((details as { phase?: string })?.phase ?? error)),
+    sleep: async () => undefined,
+    backoffMs: [],
+    watchIntervalMs: 5,
+  });
+  binding.onSessionStart("interactive", { id: "old" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  binding.onSessionShutdown();
+  const before = connects;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(connects, before, "no reconnect attempts after shutdown");
+});

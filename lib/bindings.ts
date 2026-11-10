@@ -831,6 +831,7 @@ interface TelegramLifecycleBindingDeps {
   autoConnectRuntime?: {
     onSessionStart: (mode: string, ctx: Pi.ExtensionContext) => void;
     onManualDisconnect: () => void;
+    onSessionShutdown?: () => void;
   };
   isSessionContextActive: (ctx: Pi.ExtensionContext) => boolean;
   isTurnTransportActive?: (turn: Queue.PendingTelegramTurn) => boolean;
@@ -1182,6 +1183,9 @@ export function registerTelegramLifecycleRuntimeHooks({
       autoConnectRuntime?.onSessionStart(ctx.mode, ctx);
     },
     async onSessionShutdown(event, ctx) {
+      // Before the active-context check: the watcher must stop with this
+      // runtime even when the context is already being replaced.
+      autoConnectRuntime?.onSessionShutdown?.();
       if (!isSessionContextActive(ctx)) return;
       agentLifecycleHooks.clearRetainedAgentEnd();
       activityRuntime.onSessionShutdown();
