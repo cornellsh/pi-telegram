@@ -112,6 +112,8 @@ export interface TelegramBusLeaderTargetProvisionerDeps<TContext> {
     details?: Record<string, unknown>,
   ) => void;
   getNowMs?: () => number;
+  /** Defaults to the real process check; injectable for tests. */
+  isInstanceProcessGone?: (instanceId: string) => boolean;
 }
 
 export interface TelegramBusFollowerTargetProvisionerDeps {
@@ -610,6 +612,17 @@ export function createTelegramBusFollowerTargetProvisioner(
         const nowMs = getNowMs();
         const refreshedRecord = deps.topicTargetStore.upsert({
           ...reconnectRecord,
+          // A demoted leader's record carries a placeholder key; adopt the
+          // session's real one so later restarts find it.
+          ...(reconnectRecord.profileKey?.startsWith("manual:demoted:")
+            ? {
+                profileKey: followerProfileKey,
+                owner:
+                  followerOwner.kind === "manual-follower"
+                    ? followerOwner
+                    : { kind: "manual-follower" as const, instanceId: registration.instanceId },
+              }
+            : {}),
           instanceId: registration.instanceId,
           updatedAtMs: nowMs,
           lastSyncObservedAtMs: nowMs,
@@ -1026,6 +1039,9 @@ export function createTelegramBusLeaderTargetProvisioner<TContext>(
         topicTargetStore: deps.topicTargetStore,
         callApi: deps.callApi,
         recordEvent: deps.recordRuntimeEvent,
+        isInstanceProcessGone:
+          deps.isInstanceProcessGone ??
+          ((instanceId) => isTelegramBusInstanceProcessGone(instanceId)),
       });
     } finally {
       deps.onProvisioningEnd?.();
@@ -1933,7 +1949,10 @@ export function createTelegramBusLeaderRuntime<TContext>(
 ): TelegramBusLeaderRuntime<TContext> {
   const getNowMs = deps.getNowMs ?? Date.now;
   const followerPruneIntervalMs = deps.followerPruneIntervalMs ?? 1000;
-  const followerStaleAfterMs = deps.followerStaleAfterMs ?? 5000;
+  // Longer than a follower's own heartbeat timeout budget, so a follower that
+  // is only slow under load is never dropped while it still believes itself
+  // registered.
+  const followerStaleAfterMs = deps.followerStaleAfterMs ?? 20_000;
   const runFollowerMutation = createTelegramBusFollowerMutationRunner();
   let pruneInterval: ReturnType<typeof setInterval> | undefined;
   let pruneGeneration = 0;

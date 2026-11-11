@@ -30,6 +30,8 @@ export interface TelegramLeaderThreadSyncDeps {
   forceFreshUnnamed?: boolean;
   getNowMs?: () => number;
   getRandom?: () => number;
+  /** Tells a demoted leader (still running) from a dead one. */
+  isInstanceProcessGone?: (instanceId: string) => boolean;
   getCurrentLeaderEpoch?: () => number | string | undefined;
   getThreadReconciliationMachineState?: () =>
     ThreadReconciler.ThreadReconciliationMachineState | undefined;
@@ -646,6 +648,7 @@ export async function ensureTelegramLeaderThreadBinding(
     getNowMs: deps.getNowMs,
     getRandom: deps.getRandom,
     recordEvent: deps.recordEvent,
+    isInstanceProcessGone: deps.isInstanceProcessGone,
   });
   assertLeaderEpoch("after-provision");
   if (!ownTarget) return undefined;

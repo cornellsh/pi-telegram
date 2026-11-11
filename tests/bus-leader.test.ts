@@ -3089,3 +3089,30 @@ test("an alias never takes a topic from a live session", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a demoted leader rejoining as a follower gets its own topic back and its real key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-demoted-rejoin-"));
+  const store = createTelegramTopicTargetStore({ path: join(dir, "state.json"), getNowMs: () => 1000 });
+  store.upsert({
+    profileKey: "manual:demoted:78025:1",
+    owner: { kind: "manual-follower", instanceId: "demoted:78025:1" },
+    target: { chatId: 7, threadId: 42 },
+    status: "active",
+    createdAtMs: 900,
+    updatedAtMs: 950,
+    instanceId: "78025:1",
+    slot: "N",
+    threadName: "uzo-landing2",
+  });
+  const calls: { method: string; body: Record<string, unknown> }[] = [];
+  try {
+    const provision = provisioner(store, new Set(), calls, { ms: 1001 });
+    const got = await provision({ instanceId: "78025:1", profileKey: "manual:rt:srv:pane:%12", connectedAtMs: 1001 });
+    assert.equal(got?.threadId, 42);
+    assert.ok(!calls.some((c) => c.method === "createForumTopic"));
+    const record = store.list().find((r) => r.target.threadId === 42);
+    assert.equal(record?.profileKey, "manual:rt:srv:pane:%12");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

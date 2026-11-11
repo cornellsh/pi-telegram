@@ -2216,6 +2216,11 @@ export interface TelegramOwnTopicProvisionDeps {
     message: string,
     details?: Record<string, unknown>,
   ) => void;
+  /**
+   * Whether a previous leader's process has provably ended. Absent means
+   * "assume it has", the behaviour before demotion was told apart from death.
+   */
+  isInstanceProcessGone?: (instanceId: string) => boolean;
 }
 
 export interface TelegramOwnTopicProvisionResult {
@@ -2393,6 +2398,35 @@ export async function provisionOwnBusTopic(
         previousInstanceId: record.instanceId,
         instanceId: deps.instanceId,
         profileKey,
+      });
+      continue;
+    }
+    // A leader that lost its lease without dying (its event loop stalled, a
+    // reload raced the election) is still a live session and rejoins as a
+    // follower. Deleting its topic made that rejoin create a replacement:
+    // uzo-landing2's tab was deleted and recreated as "Nimbus" on 11.11. The
+    // record is handed to it as a follower record instead; its registration
+    // matches by instance id, and the dead-session prune removes it if the
+    // process ends without rejoining.
+    if (
+      record.instanceId &&
+      deps.isInstanceProcessGone &&
+      !deps.isInstanceProcessGone(record.instanceId)
+    ) {
+      deps.store.upsert({
+        ...record,
+        profileKey: `manual:demoted:${record.instanceId}`,
+        owner: { kind: "manual-follower", instanceId: `demoted:${record.instanceId}` },
+        status: "active",
+        updatedAtMs: nowMs,
+        lastReconcileAction: "leader-topic-demoted-leader-preserve",
+      });
+      deps.recordEvent("bus", "Previous leader is still running; its topic is kept for its rejoin", {
+        phase: "leader-topic-demoted-leader-preserve",
+        chatId: record.target.chatId,
+        threadId: record.target.threadId,
+        previousInstanceId: record.instanceId,
+        instanceId: deps.instanceId,
       });
       continue;
     }

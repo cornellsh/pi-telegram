@@ -3443,3 +3443,69 @@ test("records of sessions that died without disconnecting stop holding slots", a
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("a leader demoted while still running keeps its topic for its rejoin", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-demoted-leader-"));
+  const calls: string[] = [];
+  const store = createTelegramTopicTargetStore({ path: join(dir, "telegram-targets.json"), getNowMs: () => 2000 });
+  try {
+    store.upsert({
+      profileKey: "cwd:/uzo",
+      owner: { kind: "leader", cwd: "/uzo", instanceId: "78025:1" },
+      target: { chatId: 7, threadId: 10 },
+      status: "active",
+      createdAtMs: 900,
+      updatedAtMs: 900,
+      instanceId: "78025:1",
+      slot: "A",
+      threadName: "uzo-landing2",
+    });
+    store.upsert({
+      profileKey: "manual:dska",
+      owner: { kind: "manual-follower", instanceId: "dska" },
+      target: { chatId: 7, threadId: 12 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "96674:1",
+      slot: "C",
+      threadName: "s2",
+    });
+    await store.persist();
+    await provisionOwnBusTopic({
+      getAllowedUserId: () => 7,
+      instanceId: "96674:1",
+      cwd: "/dska",
+      store,
+      async callApi<TResponse>(method: string) {
+        calls.push(method);
+        return { message_thread_id: 99 } as TResponse;
+      },
+      recordEvent() {},
+      isInstanceProcessGone: () => false, // the old leader stalled; it did not die
+    });
+    assert.ok(!calls.includes("deleteForumTopic"), "the live session's topic is not deleted");
+    const kept = store.list().find((record) => record.target.threadId === 10);
+    assert.equal(kept?.owner?.kind, "manual-follower");
+    assert.equal(kept?.instanceId, "78025:1", "matched by the rejoining process's instance id");
+
+    // A dead previous leader is still cleaned up as before.
+    calls.length = 0;
+    store.upsert({ ...kept!, profileKey: "cwd:/gone", owner: { kind: "leader", cwd: "/gone", instanceId: "11:1" }, instanceId: "11:1" });
+    await provisionOwnBusTopic({
+      getAllowedUserId: () => 7,
+      instanceId: "96674:1",
+      cwd: "/dska",
+      store,
+      async callApi<TResponse>(method: string) {
+        calls.push(method);
+        return { message_thread_id: 99 } as TResponse;
+      },
+      recordEvent() {},
+      isInstanceProcessGone: () => true,
+    });
+    assert.ok(calls.includes("deleteForumTopic"));
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});
