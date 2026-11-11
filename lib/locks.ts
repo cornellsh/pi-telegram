@@ -22,7 +22,11 @@ import { basename, dirname, join } from "node:path";
 import { resolveTelegramOwnersPath } from "./paths.ts";
 
 export const TELEGRAM_LOCK_KEY = "default";
-export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 8_000;
+// A busy machine stalls the leader's event loop for several seconds; at 8 s
+// followers took the lease from a leader that was only slow (11.11, 01:33), and
+// the election cost a topic. A crashed leader now waits up to 20 s for a
+// successor; a leader that exits cleanly releases the lease at once.
+export const TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS = 20_000;
 export const TELEGRAM_OWNERSHIP_CHECK_MS = 1_000;
 export const TELEGRAM_OWNERSHIP_REFRESH_MS = 2_000;
 const TELEGRAM_LOCK_WRITE_RETRY_ATTEMPTS = 5;

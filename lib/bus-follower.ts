@@ -1210,6 +1210,19 @@ export function createTelegramBusFollowerRegistrationState(
 export const TELEGRAM_BUS_FOLLOWER_RECOVERY_MAX_DELAY_MS = 5 * 60_000;
 
 /**
+ * How long heartbeats may merely time out before the follower acts on it.
+ *
+ * Heartbeats go out every second with a one-second budget. On a loaded machine
+ * (agents running Playwright suites, load average 13 on 11.11) the leader's
+ * event loop stalls for a few seconds, every follower's heartbeat times out at
+ * once, and each one started a full re-registration: a storm of retries
+ * against a leader that was only slow. A timeout is not evidence the leader
+ * is gone; a refused connection or a rejected heartbeat is, and those still
+ * recover at once.
+ */
+export const TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_BUDGET_MS = 12_000;
+
+/**
  * Delay before recovery attempt `failures` (1-based): the promotion grace,
  * doubling per consecutive failure, capped. Quick when a leader is merely
  * reloading, quiet when the refusal is not going away.
@@ -1490,6 +1503,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
   const getNowMs = deps.getNowMs ?? Date.now;
   const getPid = deps.getPid ?? (() => process.pid);
   const heartbeatMs = deps.heartbeatMs ?? 1000;
+  let lastHeartbeatOkMs = getNowMs();
   const registrationTimeoutMs =
     deps.registrationTimeoutMs ?? deps.timeoutMs ?? 30000;
   const registrationRetryAttempts =
@@ -1564,6 +1578,7 @@ export function createTelegramBusFollowerRegistrationRuntime<
       });
       if (!isCurrentHeartbeat()) return;
       if (response?.kind === "bus.ack" && response.ok) {
+        lastHeartbeatOkMs = getNowMs();
         const heartbeatResult = isRecord(response.result)
           ? response.result
           : undefined;
@@ -1581,6 +1596,10 @@ export function createTelegramBusFollowerRegistrationRuntime<
       }
     } catch (error) {
       if (!isCurrentHeartbeat()) return;
+      const slowNotGone =
+        (error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT" &&
+        getNowMs() - lastHeartbeatOkMs < TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_BUDGET_MS;
+      if (slowNotGone) return;
       try {
         deps.recordRuntimeEvent?.("bus", error, {
           phase: "follower-heartbeat",
@@ -1619,6 +1638,8 @@ export function createTelegramBusFollowerRegistrationRuntime<
     return tracked;
   };
   const startHeartbeat = (socketPath: string) => {
+    // A registration just succeeded: the timeout budget starts now.
+    lastHeartbeatOkMs = getNowMs();
     stopHeartbeat();
     activeLeaderSocketPath = socketPath;
     heartbeatInterval = setInterval(() => {

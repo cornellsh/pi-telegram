@@ -3047,3 +3047,47 @@ test("Bus follower refused by a live leader backs off instead of retrying every 
   assert.deepEqual(delays, [2_500]);
   assert.equal(getTelegramBusFollowerRecoveryDelayMs(2_500, 1), 2_500);
 });
+
+test("Bus follower rides out a slow leader instead of re-registering on every timeout", async () => {
+  const { TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_BUDGET_MS } = await import("../lib/bus-follower.ts");
+  const dir = mkdtempSync(join(tmpdir(), "pi-telegram-bus-follower-slow-leader-"));
+  const socketPath = join(dir, "bus.sock");
+  const failures: string[] = [];
+  let stalled = false;
+  let nowMs = 1_000_000;
+  let seq = 0;
+  const server = createTelegramBusLocalServer({
+    socketPath,
+    handleEnvelope: async (envelope) => {
+      if (stalled && envelope.kind === "follower.heartbeat") {
+        await new Promise((resolve) => setTimeout(resolve, 80)); // longer than the client timeout
+      }
+      return { kind: "bus.ack", requestId: envelope.requestId, ok: true };
+    },
+  });
+  const follower = createTelegramBusFollowerRegistrationRuntime({
+    instanceId: "inst-a",
+    createRequestId: () => `inst-a:${++seq}`,
+    registrationState: createTelegramBusFollowerRegistrationState(),
+    heartbeatMs: 10,
+    timeoutMs: 30,
+    getNowMs: () => nowMs,
+    onHeartbeatFailure(error) {
+      failures.push(String(error));
+    },
+  });
+  try {
+    await server.start();
+    await follower.registerWithLeader({ cwd: "/repo" }, { busSocketPath: socketPath });
+    stalled = true;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(failures, [], "timeouts inside the budget are tolerated");
+    nowMs += TELEGRAM_BUS_FOLLOWER_HEARTBEAT_TIMEOUT_BUDGET_MS + 1;
+    await waitForCondition(() => failures.length > 0, 500);
+    assert.match(failures[0]!, /Timed out/u, "past the budget the follower recovers");
+  } finally {
+    follower.stop();
+    await server.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -997,7 +997,7 @@ test("Lock election cannot replace an observed stale owner after its lease refre
   }
 });
 
-test("Lock runtime applies the eight-second bus leader stale threshold", () => {
+test("Lock runtime applies the bus leader stale threshold", () => {
   const temp = createTempLockPath();
   try {
     let nowMs = 1000;
@@ -1017,9 +1017,9 @@ test("Lock runtime applies the eight-second bus leader stale threshold", () => {
       staleHeartbeatMs: TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS,
       isProcessAlive: () => true,
     });
-    nowMs = 8999;
+    nowMs = 1000 + TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS - 1;
     assert.equal(follower.getState().kind, "active-elsewhere");
-    nowMs = 9001;
+    nowMs = 1000 + TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS + 1;
     assert.equal(follower.getState().kind, "stale");
   } finally {
     rmSync(temp.dir, { recursive: true, force: true });
@@ -1229,7 +1229,7 @@ test("Stale leader election admits one observed-owner candidate and fences the o
       });
     const first = createCandidate(11, "candidate-a");
     const second = createCandidate(12, "candidate-b");
-    nowMs = 9001;
+    nowMs = 1000 + TELEGRAM_BUS_LEADER_STALE_HEARTBEAT_MS + 1;
     const firstObservation = first.getState();
     const secondObservation = second.getState();
     assert.equal(firstObservation.kind, "stale");
