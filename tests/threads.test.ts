@@ -3509,3 +3509,52 @@ test("a leader demoted while still running keeps its topic for its rejoin", asyn
     await rm(dir, { force: true, recursive: true });
   }
 });
+
+test("a session reloaded into the leader keeps its own topic; an older duplicate wins", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-telegram-same-process-"));
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  const store = createTelegramTopicTargetStore({ path: join(dir, "t.json"), getNowMs: () => 5000 });
+  try {
+    store.upsert({
+      profileKey: "manual:rt:srv:pane:%31",
+      owner: { kind: "manual-follower", instanceId: "rt:srv:pane:%31" },
+      target: { chatId: 7, threadId: 191698 },
+      status: "active",
+      createdAtMs: 1000,
+      updatedAtMs: 1000,
+      instanceId: "96674:100",
+      slot: "S",
+      threadName: "s2",
+    });
+    store.upsert({
+      profileKey: "cwd:/dska",
+      owner: { kind: "leader", cwd: "/dska", instanceId: "96674:200" },
+      target: { chatId: 7, threadId: 209329 },
+      status: "active",
+      createdAtMs: 4000,
+      updatedAtMs: 4000,
+      instanceId: "96674:200",
+      slot: "N",
+      threadName: "Maple",
+    });
+    await store.persist();
+    const result = await provisionOwnBusTopic({
+      getAllowedUserId: () => 7,
+      instanceId: "96674:300", // the same process, reloaded again
+      cwd: "/dska",
+      store,
+      async callApi<TResponse>(method: string, body: Record<string, unknown>) {
+        calls.push({ method, body });
+        return { message_thread_id: 999 } as TResponse;
+      },
+      recordEvent() {},
+      isInstanceProcessGone: () => false,
+    });
+    assert.equal(result?.target.threadId, 191698, "the topic with the conversation is kept");
+    assert.ok(!calls.some((c) => c.method === "createForumTopic"), "no new tab");
+    assert.ok(calls.some((c) => c.method === "deleteForumTopic" && c.body.message_thread_id === 209329), "the duplicate is removed");
+    assert.deepEqual(store.list().map((r) => r.target.threadId), [191698]);
+  } finally {
+    await rm(dir, { force: true, recursive: true });
+  }
+});

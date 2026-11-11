@@ -2235,6 +2235,66 @@ export interface TelegramOwnTopicProvisionResult {
  * This is a thread-binding primitive; sync policy decides when startup/connect
  * should call it to ensure the leader has a visible working thread.
  */
+/**
+ * One pi process is one session, so it has one topic, whatever role it held
+ * when that topic was made. A reload keeps the pid but mints a new instance id,
+ * and a session that was a follower before reloading into the leader has its
+ * topic under a follower record the leader lookup (by cwd) never matches: `s2`
+ * got a second tab, "s2-2", on 11.11. Adopt this process's topic as the leader
+ * topic. Where an earlier run of this bug already left several, keep the oldest
+ * (it holds the conversation) and delete the newer ones.
+ */
+async function adoptSameProcessTopic(
+  deps: TelegramOwnTopicProvisionDeps,
+  profileKey: string,
+  owner: TelegramThreadOwner,
+  nowMs: number,
+): Promise<void> {
+  const mine = deps.store
+    .list()
+    .filter(
+      (record) =>
+        isCurrentThreadRecord(record) &&
+        isSameProcessInstance(record.instanceId, deps.instanceId),
+    )
+    .sort((a, b) => (a.createdAtMs ?? 0) - (b.createdAtMs ?? 0));
+  if (mine.length === 0) return;
+  const [keep, ...extra] = mine;
+  if (extra.length === 0 && keep!.profileKey === profileKey) return;
+  for (const record of extra) {
+    try {
+      await deps.callApi("deleteForumTopic", {
+        chat_id: record.target.chatId,
+        message_thread_id: record.target.threadId,
+      });
+    } catch (error) {
+      deps.recordEvent("bus", error instanceof Error ? error.message : String(error), {
+        phase: "leader-topic-same-process-duplicate-delete",
+        chatId: record.target.chatId,
+        threadId: record.target.threadId,
+      });
+    }
+    deps.store.markStaleByTarget(record.target, "deleted", "Duplicate topic of the same session.");
+  }
+  deps.store.upsert({
+    ...keep!,
+    profileKey,
+    owner,
+    status: "active",
+    instanceId: deps.instanceId,
+    updatedAtMs: nowMs,
+    lastReconcileAction: "leader-topic-same-process-adopt",
+  });
+  await deps.store.persist();
+  deps.recordEvent("bus", "Bus leader adopted its own session's existing topic", {
+    phase: "leader-topic-same-process-adopt",
+    chatId: keep!.target.chatId,
+    threadId: keep!.target.threadId,
+    duplicatesDeleted: extra.length,
+    instanceId: deps.instanceId,
+  });
+}
+
 export async function provisionOwnBusTopic(
   deps: TelegramOwnTopicProvisionDeps,
 ): Promise<TelegramOwnTopicProvisionResult | undefined> {
@@ -2514,6 +2574,7 @@ export async function provisionOwnBusTopic(
       },
     );
   }
+  await adoptSameProcessTopic(deps, profileKey, currentLeaderOwner, nowMs);
   const provision = createTelegramTopicTargetProvisioner({
     topicChatId: chatId,
     store: deps.store,
